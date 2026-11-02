@@ -166,3 +166,56 @@ body.has-topbar nav{top:25px}
 .steps li:last-child{border-bottom:none}
 .steps .n{width:20px;height:20px;border:1px solid var(--br2);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0;color:var(--t2)}
 .steps .n.ok{background:var(--ok);border-color:var(--ok);color:#fff}
+
+/* ── графики (чистый HTML/SVG, цвета следуют теме) ── */
+:root{--c1:#2a78d6;--c2:#eb6834;--c3:#1baf7a;--seq:var(--accent)}
+[data-theme="dark"],[data-theme="black"]{--c1:#3987e5;--c2:#d95926;--c3:#199e70}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--t1);margin:0 0 10px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.chart-t{font-size:12px;color:var(--t2);margin:-6px 0 10px}
+.chart-empty{color:var(--t2);font-size:12px;padding:18px 0;text-align:center}
+
+/* горизонтальные ранжированные столбцы */
+.hb-row{display:grid;grid-template-columns:minmax(90px,34%) 1fr 54px;gap:8px;align-items:center;padding:3px 0;font-size:12px}
+.hb-row.click{cursor:pointer}
+.hb-row.click:hover .hb-l{color:var(--accent)}
+.hb-l{color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hb-t{height:14px;background:var(--b3);border-radius:0 4px 4px 0}
+.hb-t i{display:block;height:100%;min-width:2px;background:var(--seq);border-radius:0 4px 4px 0}
+.hb-v{color:var(--t0);font-variant-numeric:tabular-nums;text-align:right}
+
+/* колонки (в том числе составные) */
+.cols{display:flex;align-items:flex-end;gap:10px;height:170px;padding:18px 4px 0;border-bottom:1px solid var(--br2);
+  background:repeating-linear-gradient(to top,transparent 0,transparent 41px,var(--br1) 41px,var(--br1) 42px)}
+.col{flex:1;min-width:0;max-width:56px;margin:0 auto;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:stretch;position:relative}
+.col .seg{background:var(--seq);margin-top:2px;min-height:0}
+.col .seg:first-child{border-radius:4px 4px 0 0}
+.col .tot{position:absolute;left:0;right:0;text-align:center;font-size:10px;color:var(--t1);font-variant-numeric:tabular-nums;transform:translateY(-14px)}
+.col-labels{display:flex;gap:10px;padding:5px 4px 0}
+.col-labels span{flex:1;min-width:0;max-width:56px;margin:0 auto;text-align:center;font-size:10px;color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* линия (SVG) */
+.line-svg{width:100%;height:auto;display:block}
+.line-svg text{fill:var(--t2);font-size:10px;font-family:inherit}
+.line-svg .grid{stroke:var(--br1);stroke-width:1}
+.line-svg .ln{fill:none;stroke:var(--seq);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.line-svg .area{fill:var(--seq);opacity:.1}
+.line-svg .dot{fill:var(--seq);stroke:var(--b1);stroke-width:2}
+
+/* подсказка */
+#tip{position:fixed;z-index:300;pointer-events:none;background:var(--b1);border:1px solid var(--br2);color:var(--t0);
+  font-size:12px;padding:6px 9px;border-radius:3px;box-shadow:0 4px 14px rgba(0,0,0,.35);max-width:280px;display:none;white-space:pre-line}
+
+/* записи в карточке ученика */
+.chips{display:flex;gap:4px;flex-wrap:wrap}
+.chip{display:inline-block;min-width:20px;text-align:center;font-size:11px;padding:1px 6px;border:1px solid var(--br2);border-radius:3px;font-variant-numeric:tabular-nums}
+.chip.g5,.chip.g4{background:rgba(107,167,107,.14);border-color:rgba(107,167,107,.35)}
+.chip.g3{background:rgba(196,184,107,.14);border-color:rgba(196,184,107,.35)}
+.chip.g2,.chip.g1{background:rgba(196,122,122,.14);border-color:rgba(196,122,122,.35)}
+.rec-del{background:none;border:none;color:var(--t2);cursor:pointer;font-size:14px;padding:0 4px}
+.rec-del:hover{color:var(--bad)}
+.rec-list{font-size:12px}
+.rec-list .list-row{padding:6px 8px}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
+@media(max-width:600px){.form-grid{grid-template-columns:1fr}}
+.hide{display:none!important}

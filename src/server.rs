@@ -76,6 +76,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/students", get(list_students))
         .route("/api/v1/students/{id}", get(get_student))
         .route("/api/v1/students/{id}/context", get(student_context))
+        .route("/api/v1/students/{id}/records", post(add_record))
+        .route("/api/v1/records/{id}", delete(delete_record))
+        .route("/api/v1/stats", get(stats))
+        .route("/api/v1/import/template.csv", get(admin_api::import_template))
         .route("/api/v1/seed", post(seed_demo))
         .route("/api/v1/import", post(import_data))
         // ── модели ──
@@ -160,7 +164,9 @@ fn required_perm(method: &axum::http::Method, path: &str) -> Need {
     match path {
         "/api/v1/logout" | "/api/v1/me" | "/api/v1/me/password" | "/api/v1/engine/status" => Need::Any,
         "/api/v1/engine/install" => Need::Perm("models"),
-        "/api/v1/import" | "/api/v1/seed" => Need::Perm("import"),
+        "/api/v1/import" | "/api/v1/seed" | "/api/v1/import/template.csv" => Need::Perm("import"),
+        p if p.starts_with("/api/v1/records/") => Need::Perm("import"),
+        p if p.starts_with("/api/v1/students/") && method == Method::POST => Need::Perm("import"),
         "/api/v1/generate" => Need::Perm("analyze"),
         "/api/v1/models/catalog" | "/api/v1/models/status" | "/api/v1/models" if read => Need::Any,
         "/api/v1/params" if read => Need::Any,
@@ -386,6 +392,12 @@ async fn get_student(State(state): State<Arc<AppState>>, Path(id): Path<i64>) ->
                 "recent": d.recent,
                 "strengths": d.strengths,
                 "weaknesses": d.weaknesses,
+                "grades": d.grades,
+                "grade_items": d.grade_items,
+                "absence": d.absence,
+                "portfolio_items": d.portfolio_items,
+                "behavior": d.behavior,
+                "meals": d.meals,
                 "profile": profile,
             }))
             .into_response()
@@ -449,33 +461,10 @@ async fn import_data(
 
     // JSON-массив объектов.
     if ct.contains("json") || text.trim_start().starts_with('[') {
-        let rows: Vec<students::ImportRow> = match serde_json::from_str(&text) {
-            Ok(r) => r,
-            Err(e) => return json_err(&format!("не удалось разобрать JSON: {e}"), StatusCode::BAD_REQUEST),
+        return match students::import_json(&state.db, &text) {
+            Ok(r) => Json(r).into_response(),
+            Err(e) => json_err(&format!("ошибка импорта: {e}"), StatusCode::BAD_REQUEST),
         };
-        let mut result = students::ImportResult {
-            rows_read: rows.len(),
-            students_created: 0,
-            students_updated: 0,
-            activities_created: 0,
-            errors: Vec::new(),
-        };
-        for (i, row) in rows.iter().enumerate() {
-            match students::upsert_row(&state.db, row, &mut result) {
-                Ok(Some(sid)) => {
-                    if let Err(e) = students::insert_row(&state.db, sid, row) {
-                        result.errors.push(format!("строка {}: {e}", i + 1));
-                    } else {
-                        result.activities_created += 1;
-                    }
-                }
-                Ok(None) => result
-                    .errors
-                    .push(format!("строка {}: не удалось определить ученика", i + 1)),
-                Err(e) => result.errors.push(format!("строка {}: {e}", i + 1)),
-            }
-        }
-        return Json(result).into_response();
     }
 
     match students::import_csv(&state.db, &text) {
@@ -483,6 +472,43 @@ async fn import_data(
         Err(e) => {
             tracing::error!("import: {e}");
             json_err(&format!("ошибка импорта: {e}"), StatusCode::BAD_REQUEST)
+        }
+    }
+}
+
+/// Добавить запись (оценка, пропуск, портфолио, поведение…) ученику.
+async fn add_record(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(row): Json<students::ImportRow>,
+) -> Response {
+    match students::add_record(&state.db, id, &row) {
+        Ok(()) => Json(json!({"status": "ok"})).into_response(),
+        Err(e) => json_err(&format!("не удалось добавить запись: {e}"), StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn delete_record(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+    match students::delete_record(&state.db, id) {
+        Ok(true) => Json(json!({"status": "ok"})).into_response(),
+        Ok(false) => json_err("запись не найдена", StatusCode::NOT_FOUND),
+        Err(e) => json_err(&format!("ошибка БД: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+#[derive(Deserialize)]
+struct StatsQuery {
+    #[serde(default)]
+    group: String,
+}
+
+/// Данные для вкладки «Статистика» (с фильтром по группе).
+async fn stats(State(state): State<Arc<AppState>>, Query(q): Query<StatsQuery>) -> Response {
+    match students::stats(&state.db, &q.group) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => {
+            tracing::error!("stats: {e}");
+            json_err(&format!("ошибка БД: {e}"), StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -650,15 +676,19 @@ async fn activate_model(
 // ── параметры генерации ──
 
 async fn get_params(State(state): State<Arc<AppState>>) -> Response {
-    match state.db.get_setting("gen_params") {
-        Some(raw) => match serde_json::from_str::<Value>(&raw) {
-            Ok(v) => Json(v).into_response(),
-            Err(_) => Json(serde_json::to_value(state.engine.default_params()).unwrap_or(json!({})))
-                .into_response(),
-        },
-        None => Json(serde_json::to_value(state.engine.default_params()).unwrap_or(json!({})))
-            .into_response(),
+    let mut v = match state.db.get_setting("gen_params") {
+        Some(raw) => serde_json::from_str::<Value>(&raw)
+            .unwrap_or_else(|_| serde_json::to_value(state.engine.default_params()).unwrap_or(json!({}))),
+        None => serde_json::to_value(state.engine.default_params()).unwrap_or(json!({})),
+    };
+    // Если свой системный промпт не задан — показываем действующий по умолчанию,
+    // чтобы его можно было прочитать и отредактировать.
+    let empty = v["system_prompt"].as_str().map(|s| s.trim().is_empty()).unwrap_or(true);
+    if empty {
+        v["system_prompt"] = json!(analysis::DEFAULT_SYSTEM_PROMPT);
     }
+    v["default_system_prompt"] = json!(analysis::DEFAULT_SYSTEM_PROMPT);
+    Json(v).into_response()
 }
 
 async fn save_params(
@@ -954,16 +984,23 @@ async fn analyze_overview(
         Err(e) => return json_err(&format!("{e}"), StatusCode::INTERNAL_SERVER_ERROR),
     };
     let summary = format!(
-        "Учеников: {}\nАктивностей: {}\nСредний результат: {}\nСреднее время на ученика: {:?} мин\n\nПо типам активности:\n{}",
+        "Учеников: {}\nУчебных записей (работы, оценки, занятия): {}\nСредний результат за работы: {}\nСредняя оценка (5-балльная шкала): {}\nПропущено уроков: {} (из них без уважительной причины: {})\nЗаписей в портфолио (достижения, грамоты, благодарности): {}\nПоведение: поощрений {}, замечаний и нарушений {}\n\nПо типам записей:\n{}",
         ov.students,
         ov.activities,
         ov.avg_ratio
             .map(|r| format!("{:.1}%", r * 100.0))
-            .unwrap_or_else(|| "н/д".into()),
-        ov.avg_minutes,
+            .unwrap_or_else(|| "нет данных".into()),
+        ov.avg_grade
+            .map(|g| format!("{g:.2}"))
+            .unwrap_or_else(|| "нет данных".into()),
+        ov.absences,
+        ov.absences_unexcused,
+        ov.portfolio,
+        ov.praises,
+        ov.remarks,
         ov.kind_breakdown
             .iter()
-            .map(|k| format!("  - {}: {} шт.", k.kind, k.count))
+            .map(|k| format!("  - {}: {} шт.", crate::labels::kind_ru(&k.kind), k.count))
             .collect::<Vec<_>>()
             .join("\n")
     );

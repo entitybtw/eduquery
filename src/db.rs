@@ -118,6 +118,29 @@ impl Db {
             );
             "#,
         )?;
+        self.add_columns()?;
+        Ok(())
+    }
+
+    /// Добавить колонки, появившиеся после первых версий (миграция «на месте»).
+    fn add_columns(&self) -> Result<()> {
+        let conn = self.conn();
+        let have: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(activities)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (name, ddl) in [
+            ("reason", "TEXT NOT NULL DEFAULT ''"),   // причина пропуска
+            ("category", "TEXT NOT NULL DEFAULT ''"), // портфолио: грамота/благодарность…; поведение: поощрение/замечание…
+            ("level", "TEXT NOT NULL DEFAULT ''"),    // портфолио: школьный … международный
+            ("comment", "TEXT NOT NULL DEFAULT ''"),  // комментарий / описание
+            ("amount", "REAL NOT NULL DEFAULT 1"),    // пропуск: сколько уроков
+        ] {
+            if !have.iter().any(|c| c == name) {
+                conn.execute(&format!("ALTER TABLE activities ADD COLUMN {name} {ddl}"), [])?;
+            }
+        }
         Ok(())
     }
 

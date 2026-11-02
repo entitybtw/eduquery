@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>eduquery</title>
-<meta name="app-version" content="0.0.3">
+<meta name="app-version" content="0.0.4">
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
@@ -35,6 +35,7 @@
       <div class="nt">
         <div class="ntb a" data-tab="dashboard" onclick="tab('dashboard')">Обзор</div>
         <div class="ntb" data-tab="students" onclick="tab('students')">Ученики</div>
+        <div class="ntb" data-tab="stats" onclick="tab('stats')">Статистика</div>
         <div class="ntb" data-tab="analyze" onclick="tab('analyze')">Анализ ИИ</div>
         <div class="ntb" data-tab="models" onclick="tab('models')">Модели</div>
         <div class="ntb" data-tab="settings" onclick="tab('settings')">Настройки</div>
@@ -107,11 +108,13 @@
       </div>
       <div class="panel" data-perm="import">
         <h3>Формат файла</h3>
-        <p class="muted">Можно выбрать сразу несколько файлов. Разделитель «,» или «;», кодировка UTF-8 или Windows-1251. CSV с заголовками. Обязательные: <code>external_id</code> или <code>full_name</code>.
-        Остальные колонки распознаются по синонимам: <code>subject</code>/<code>предмет</code>, <code>title</code>/<code>задание</code>,
-        <code>score</code>/<code>балл</code>, <code>max_score</code>, <code>date</code>/<code>дата</code>, <code>group</code>/<code>группа</code>.</p>
-        <pre class="code">external_id,full_name,group,subject,title,score,max_score,date
-STU-1001,Иванов Иван,ИП-21,Математика,Домашняя работа №1,85,100,2026-09-14</pre>
+        <p class="muted">Одна строка — одна запись. Колонки на русском, порядок любой, лишние можно не заполнять.
+        Обязательно «ID ученика» или «ФИО». «Тип записи»: <code>Домашняя работа</code>, <code>Контрольная работа</code>, <code>Проект</code>,
+        <code>Оценка</code>, <code>Пропуск</code>, <code>Портфолио</code>, <code>Поведение</code>, <code>Питание</code>.</p>
+        <p class="muted" style="margin-top:6px">Колонки: <code>ID ученика</code> <code>ФИО</code> <code>Группа</code> <code>Эл. почта</code> <code>Тип записи</code> <code>Предмет</code>
+        <code>Название</code> <code>Дата</code> <code>Балл</code> <code>Макс. балл</code> <code>Оценка</code> <code>Статус</code> <code>Время, мин</code>
+        <code>Пропущено уроков</code> <code>Причина пропуска</code> <code>Уважительная</code> <code>Категория</code> <code>Уровень / оплата</code> <code>Комментарий</code>.</p>
+        <button class="b" style="margin-top:10px" onclick="downloadTemplate()">Скачать шаблон с примерами (CSV)</button>
         <div id="importResult" class="output"></div>
       </div>
     </div>
@@ -203,6 +206,60 @@ STU-1001,Иванов Иван,ИП-21,Математика,Домашняя р�
       </div>
     </div>
 
+    <!-- ─────── Статистика ─────── -->
+    <div id="p-stats" style="display:none">
+      <div class="sh">
+        <span class="sh-t">Статистика</span>
+        <select class="search" id="stGroup" onchange="loadStats()"><option value="">Все классы и группы</option></select>
+        <button class="b" onclick="loadStats()">Обновить</button>
+      </div>
+      <div class="cards" id="stCards"></div>
+      <div class="grid2">
+        <div class="panel"><h3>Распределение оценок</h3><div id="chGradeDist"></div></div>
+        <div class="panel"><h3>Средняя оценка по предметам</h3><div id="chGradeSubj"></div></div>
+        <div class="panel"><h3>Пропуски по причинам (уроков)</h3><div id="chAbsReason"></div></div>
+        <div class="panel"><h3>Пропуски по месяцам (уроков)</h3><div id="chAbsMonth"></div></div>
+        <div class="panel"><h3>Портфолио по видам</h3><div id="chPortCat"></div></div>
+        <div class="panel"><h3>Портфолио по уровню</h3><div id="chPortLvl"></div></div>
+        <div class="panel"><h3>Поведение по месяцам</h3><div id="chBeh"></div></div>
+        <div class="panel"><h3>Питание: доля дней, когда питался</h3><div id="chMeals"></div></div>
+        <div class="panel"><h3>Средняя оценка по месяцам</h3><div id="chGradeTrend"></div></div>
+        <div class="panel"><h3>Результат за работы по месяцам</h3><div id="chRatioTrend"></div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-h">
+          <h3>Сравнение классов и групп</h3>
+          <select class="search" id="stGroupMetric" onchange="renderGroupChart()">
+            <option value="avg_grade">Средняя оценка</option>
+            <option value="absences_per_student">Пропусков на ученика</option>
+            <option value="absences_unexcused">Пропуски без уважительной причины</option>
+            <option value="remarks">Замечания и нарушения</option>
+            <option value="praises">Поощрения</option>
+            <option value="portfolio">Записей в портфолио</option>
+            <option value="meals_pct">Питание, % дней</option>
+          </select>
+        </div>
+        <div id="chGroups"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-h">
+          <h3>Рейтинг учеников</h3>
+          <select class="search" id="stRank" onchange="renderRank()">
+            <option value="remarks">Больше всего замечаний и нарушений</option>
+            <option value="praises">Больше всего поощрений</option>
+            <option value="absences_unexcused">Больше всего пропусков без уважительной причины</option>
+            <option value="absences">Больше всего пропусков</option>
+            <option value="portfolio">Самое большое портфолио</option>
+            <option value="avg_grade_hi">Лучшая средняя оценка</option>
+            <option value="avg_grade_lo">Низкая средняя оценка</option>
+            <option value="meals_pct_lo">Реже всего питаются</option>
+          </select>
+        </div>
+        <div id="chRank"></div>
+        <div class="hint">Нажмите на ученика, чтобы открыть его карточку.</div>
+      </div>
+    </div>
+
     <!-- ─────── Пользователи ─────── -->
     <div id="p-users" style="display:none">
       <div class="sh">
@@ -240,8 +297,9 @@ STU-1001,Иванов Иван,ИП-21,Математика,Домашняя р�
         </div>
         <div class="panel">
           <h3>Системный промпт</h3>
-          <div class="fg"><label>Роль ассистента</label><textarea id="pSystem" rows="16"></textarea></div>
-          <div class="hint">Этот текст подставляется в каждый запрос к модели. Он задаёт стиль и правила ответа.</div>
+          <div class="fg"><label>Текст системного промпта</label><textarea id="pSystem" rows="22"></textarea></div>
+          <button class="b" onclick="resetSystemPrompt()">Вернуть стандартный</button>
+          <div class="hint">Инструкция, которая отправляется модели с каждым запросом: какие данные она получает, как их трактовать и в каком формате отвечать. После правки нажмите «Сохранить» слева.</div>
           <div class="panel" style="margin-top:14px">
             <h3>Интерфейс</h3>
             <div class="fg"><label>Акцентный цвет</label><input type="color" id="acPick" oninput="applyAccent(this.value)"></div>
@@ -302,7 +360,54 @@ STU-1001,Иванов Иван,ИП-21,Математика,Домашняя р�
   </div>
 </div>
 
+<div id="mRecord" class="mbg">
+  <div class="md" onclick="event.stopPropagation()">
+    <div class="md-h"><h2>Добавить запись</h2><button class="b" onclick="closeRecord()">Закрыть</button></div>
+    <div class="form-grid">
+      <div class="fg"><label>Тип записи</label>
+        <select id="rcKind" onchange="rcKindChanged()">
+          <option value="grade">Оценка</option>
+          <option value="absence">Пропуск</option>
+          <option value="portfolio">Портфолио (достижение, грамота, благодарность)</option>
+          <option value="behavior">Поведение</option>
+          <option value="meal">Питание</option>
+          <option value="task">Домашняя работа</option>
+          <option value="quiz">Контрольная работа</option>
+          <option value="submission">Проект</option>
+        </select></div>
+      <div class="fg"><label>Дата</label><input id="rcDate" type="date"></div>
+      <div class="fg" data-for="grade absence task quiz submission"><label>Предмет</label><input id="rcSubject" placeholder="Математика"></div>
+      <div class="fg" data-for="portfolio task quiz submission grade"><label>Название</label><input id="rcTitle" placeholder="Название / тема"></div>
+      <div class="fg" data-for="grade"><label>Оценка (2–5)</label><input id="rcGrade" type="number" min="1" max="5" step="1" value="5"></div>
+      <div class="fg" data-for="absence"><label>Пропущено уроков</label><input id="rcAmount" type="number" min="1" step="1" value="1"></div>
+      <div class="fg" data-for="absence"><label>Причина пропуска</label><input id="rcReason" list="dlReasons" placeholder="Болезнь"></div>
+      <div class="fg" data-for="absence"><label>Уважительная причина?</label><select id="rcExcused"><option value="">определить по причине</option><option value="да">да</option><option value="нет">нет</option></select></div>
+      <div class="fg" data-for="portfolio"><label>Вид</label><input id="rcCatPort" list="dlPort" placeholder="Грамота"></div>
+      <div class="fg" data-for="portfolio"><label>Уровень</label>
+        <select id="rcLevel"><option>Школьный</option><option>Муниципальный</option><option>Региональный</option><option>Всероссийский</option><option>Международный</option></select></div>
+      <div class="fg" data-for="behavior"><label>Категория</label>
+        <select id="rcCatBeh"><option>Поощрение</option><option>Замечание</option><option>Нарушение</option><option>Нейтрально</option></select></div>
+      <div class="fg" data-for="meal"><label>Вид питания</label>
+        <select id="rcMeal"><option>Завтрак</option><option selected>Обед</option><option>Полдник</option></select></div>
+      <div class="fg" data-for="meal"><label>Питался?</label><select id="rcAte"><option value="питался">да</option><option value="не питался">нет</option></select></div>
+      <div class="fg" data-for="meal"><label>Форма питания</label>
+        <select id="rcPay"><option>Бесплатное</option><option>Льготное</option><option>Платное</option></select></div>
+      <div class="fg" data-for="task quiz submission"><label>Балл</label><input id="rcScore" type="number" step="0.5"></div>
+      <div class="fg" data-for="task quiz submission"><label>Макс. балл</label><input id="rcMax" type="number" step="0.5" value="100"></div>
+      <div class="fg" data-for="task quiz submission"><label>Статус</label>
+        <select id="rcStatus"><option value="выполнено вовремя">выполнено вовремя</option><option value="с опозданием">с опозданием</option><option value="не выполнено">не выполнено</option><option value="сдано">сдано</option></select></div>
+    </div>
+    <div class="fg" data-for="absence portfolio behavior grade"><label>Комментарий</label><input id="rcComment"></div>
+    <datalist id="dlReasons"><option>Болезнь</option><option>Справка от врача</option><option>Семейные обстоятельства</option><option>Участие в соревнованиях</option><option>Участие в олимпиаде</option><option>Без уважительной причины</option><option>Прогул</option></datalist>
+    <datalist id="dlPort"><option>Грамота</option><option>Благодарность</option><option>Достижение</option><option>Диплом</option><option>Сертификат</option></datalist>
+    <button class="b b-p" onclick="saveRecord()">Сохранить</button>
+    <div id="rcMsg" class="output"></div>
+  </div>
+</div>
+
+<div id="tip"></div>
 <div id="toasts"></div>
 <script src="/assets/app.js"></script>
+<script src="/assets/stats.js"></script>
 </body>
 </html>

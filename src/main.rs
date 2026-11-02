@@ -13,6 +13,7 @@ mod seed;
 mod server;
 mod students;
 mod users;
+mod labels;
 mod admin_api;
 
 use anyhow::Result;

@@ -6,6 +6,8 @@ student data never leaves your machine.
 
 - Tiny image: the llama.cpp engine and the models are **downloaded automatically** on first run.
 - One container, no external services, no API keys.
+- Journal data beyond grades: **absences with reasons, portfolio (certificates, awards, thanks), behaviour, school meals** — all of it goes into the AI analysis.
+- A **Statistics** tab with charts (grades, absences, portfolio, behaviour, meals; per class; student rankings).
 - Multi-user: accounts stored in SQLite, per-user permissions and AI request limits.
 - Tables in and out: upload CSV/JSON (several files at once), download the table you are looking at as CSV.
 - Password login and demo data included so you can try it right away.
@@ -65,7 +67,8 @@ Everything downloaded is stored in `./data` and survives container rebuilds and 
 | Section | What it does |
 |---|---|
 | Overview | Summary per class/group, activity trends |
-| Students | List, student card, context (grades, attendance, activities) |
+| Students | List with grade / absences / portfolio / remarks / meals columns; student card with all sections; add or delete records by hand |
+| Statistics | Charts and counters: grade distribution, grades per subject, absences by reason and month (excused vs. unexcused), portfolio by kind and level, praises vs. remarks by month, meals, monthly trends, class comparison, top-10 student rankings (most remarks, absences, …). Filter by class/group |
 | Student analysis | LLM review of one student's data; result is saved to history |
 | Comparison | Compare several students |
 | Ask about data | Free-form question to the LLM about selected data |
@@ -75,6 +78,20 @@ Everything downloaded is stored in `./data` and survives container rebuilds and 
 | Models | Catalog, download by URL, activate, delete |
 | Parameters | temperature, top-p/top-k, repeat penalty, DRY, max tokens, context, system prompt |
 
+### What is recorded (record types)
+
+| Type | Fields |
+|---|---|
+| Homework / test / project (`Домашняя работа`, `Контрольная работа`, `Проект`) | subject, title, date, score / max score, status, minutes |
+| Grade (`Оценка`) | subject, grade 2–5, date |
+| Absence (`Пропуск`) | date, lessons missed, reason, excused (yes/no), subject |
+| Portfolio (`Портфолио`) | title, kind (certificate, award, thanks, diploma…), level (school … international), comment |
+| Behaviour (`Поведение`) | category (praise / remark / violation / neutral), comment |
+| Meals (`Питание`) | meal (breakfast / lunch), ate or not, payment form (free / reduced / paid) |
+
+All of this is added to the context sent to the model, section by section, and the default system prompt tells
+the model how to use each section (excused vs. unexcused absences, portfolio level, careful wording about behaviour, no invented facts).
+
 ### Model catalog
 
 | Model | Size | Use |
@@ -83,7 +100,11 @@ Everything downloaded is stored in `./data` and survives container rebuilds and 
 | Gemma 3 270M Instruct | ~250 MB | bare minimum, weak multilingual quality |
 | Qwen2.5 0.5B Instruct | ~490 MB | fast option for weak hardware |
 | Llama 3.2 1B Instruct | ~810 MB | reasonable balance |
-| Qwen2.5 1.5B Instruct | ~990 MB | best quality in the catalog, needs ≥4 GB RAM |
+| Qwen2.5 1.5B Instruct | ~990 MB | best small model, needs ≥4 GB RAM |
+| GigaChat 3.1 Lightning (Q4_K_M) | ~6.5 GB | open Russian model by Sber (MoE 10B, 1.8B active); needs ≥8 GB RAM, set `EDUQUERY_MEMORY_LIMIT=10g` or more |
+| GigaChat 3 Lightning (Q6_K) | ~8.8 GB | same family, higher-quality quantisation; needs ≥10 GB RAM, `EDUQUERY_MEMORY_LIMIT=12g` |
+
+The big GigaChat 3 (702B) is not in the catalog: it ships as multi-part GGUF files of 150+ GB.
 
 Any other **instruct GGUF** can be downloaded by direct link (Models → custom URL).
 Base (non-instruct) models will not work: a chat template is required.
@@ -112,9 +133,12 @@ Accounts live in the SQLite database. `EDUQUERY_ADMIN_USER` / `EDUQUERY_ADMIN_PA
 
 - **Import** (Students tab): choose one or more `.csv` / `.json` files. Delimiter `,` or `;`, UTF-8 or
   Windows-1251, decimal comma accepted (`8,5`). Tick *replace all current data* to wipe students, activities
-  and analyses first.
+  and analyses first. Click **Download template** to get a CSV with an example row of every record type.
+- **Columns and values are in Russian** (English names are accepted too): `ID ученика`, `ФИО`, `Группа`, `Эл. почта`,
+  `Тип записи`, `Предмет`, `Название`, `Дата`, `Балл`, `Макс. балл`, `Оценка`, `Статус`, `Время, мин`,
+  `Пропущено уроков`, `Причина пропуска`, `Уважительная`, `Категория`, `Уровень / оплата`, `Комментарий`.
 - **Export**: *Download table (CSV)* saves exactly the table on screen (current search, group filter and sort);
-  *Download all records* exports every activity in the same format the importer reads, so a file can be
+  *Download all records* exports every record in the same Russian format the importer reads, so a file can be
   edited in Excel and uploaded back; the Analysis tab exports the history of AI analyses.
   Files are UTF-8 with BOM, so Excel opens them correctly.
 
@@ -164,6 +188,8 @@ GET  /health                         liveness check (no auth)
 POST /api/v1/login | /logout         GET /api/v1/me      POST /api/v1/me/password
 GET/POST /api/v1/users               PUT/DELETE /api/v1/users/{id}      (permission: users)
 GET  /api/v1/export/students.csv?q=&group=&sort=   /activities.csv   /analyses.csv   (permission: export)
+GET  /api/v1/import/template.csv     POST /api/v1/students/{id}/records     DELETE /api/v1/records/{id}   (permission: import)
+GET  /api/v1/stats?group=            data for the Statistics tab
 GET  /api/v1/engine/status           POST /api/v1/engine/install        (install: models)
 GET  /api/v1/overview | /groups
 GET  /api/v1/students                /{id}  /{id}/context
@@ -198,7 +224,7 @@ docker build -t entbtw/eduquery:latest .
 Requires Rust ≥ 1.80. Layout: `src/llm.rs` — llama-server management,
 `src/server.rs` — HTTP API, `src/models.rs` — model catalog and downloads,
 `src/users.rs` / `auth.rs` — accounts, permissions, limits, sessions,
-`src/admin_api.rs` — users, CSV export, engine endpoints, `src/students.rs` / `analysis.rs` — data and prompts, `web/` — the UI.
+`src/admin_api.rs` — users, CSV export, engine endpoints, `src/students.rs` / `analysis.rs` / `labels.rs` — data, Russian labels and prompts, `web/assets/stats.js` — charts, `web/` — the UI.
 
 ## Troubleshooting
 

@@ -145,7 +145,11 @@ fn csv_response(filename: &str, rows: Vec<Vec<String>>) -> Response {
     let mut out = vec![0xEF, 0xBB, 0xBF];
     out.extend_from_slice(&body);
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M");
-    let disp = format!("attachment; filename=\"{filename}-{stamp}.csv\"");
+    let encoded: String = format!("{filename}-{stamp}.csv")
+        .bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b == b'-' || b == b'.' { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect();
+    let disp = format!("attachment; filename*=UTF-8''{encoded}");
     let mut resp = (StatusCode::OK, out).into_response();
     let h = resp.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/csv; charset=utf-8"));
@@ -157,6 +161,27 @@ fn csv_response(filename: &str, rows: Vec<Vec<String>>) -> Response {
 
 fn opt<T: ToString>(v: Option<T>) -> String {
     v.map(|x| x.to_string()).unwrap_or_default()
+}
+
+/// Число без лишних нулей: 8.5, 100.
+fn num(v: Option<f64>) -> String {
+    match v {
+        Some(x) if (x - x.round()).abs() < 1e-9 => format!("{}", x.round() as i64),
+        Some(x) => format!("{x:.2}").trim_end_matches('0').trim_end_matches('.').to_string(),
+        None => String::new(),
+    }
+}
+
+/// «2026-09-14 00:00:00» → «2026-09-14»; со временем — «2026-09-14 10:30».
+fn date_out(s: &str) -> String {
+    match s.strip_suffix(" 00:00:00") {
+        Some(d) => d.to_string(),
+        None => s.chars().take(16).collect(),
+    }
+}
+
+fn header(cols: &[&str]) -> Vec<String> {
+    cols.iter().map(|s| s.to_string()).collect()
 }
 
 #[derive(Deserialize)]
@@ -178,13 +203,12 @@ pub async fn export_students(
         Ok(l) => l,
         Err(e) => return err(format!("ошибка БД: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     };
-    let mut rows = vec![[
-        "external_id", "full_name", "group", "email", "grade", "activities",
-        "avg_score", "avg_ratio_percent", "total_minutes", "last_activity",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect::<Vec<_>>()];
+    let mut rows = vec![header(&[
+        "ID ученика", "ФИО", "Группа", "Эл. почта", "Курс", "Записей", "Средний балл",
+        "Успеваемость, %", "Средняя оценка", "Пропущено уроков", "Из них без уважит. причины",
+        "Записей в портфолио", "Поощрений", "Замечаний и нарушений", "Питался, % дней",
+        "Время, мин", "Последняя активность",
+    ])];
     for s in list {
         rows.push(vec![
             s.external_id,
@@ -193,23 +217,38 @@ pub async fn export_students(
             s.email,
             opt(s.grade),
             s.activities.to_string(),
-            opt(s.avg_score.map(|v| format!("{v:.2}"))),
-            opt(s.avg_ratio.map(|v| format!("{:.1}", v * 100.0))),
-            opt(s.total_minutes.map(|v| format!("{v:.0}"))),
-            opt(s.last_activity),
+            num(s.avg_score),
+            num(s.avg_ratio.map(|v| (v * 1000.0).round() / 10.0)),
+            num(s.avg_grade),
+            s.absences.to_string(),
+            s.absences_unexcused.to_string(),
+            s.portfolio.to_string(),
+            s.praises.to_string(),
+            s.remarks.to_string(),
+            if s.meals > 0 { num(Some((s.meals_eaten as f64 / s.meals as f64 * 1000.0).round() / 10.0)) } else { String::new() },
+            num(s.total_minutes.map(|v| v.round())),
+            s.last_activity.map(|d| date_out(&d)).unwrap_or_default(),
         ]);
     }
-    csv_response("students", rows)
+    csv_response("ученики", rows)
 }
 
-/// Все активности в формате, который принимает импорт (можно загрузить обратно).
+/// Колонки «записей» — те же, что принимает импорт, поэтому файл можно загрузить обратно.
+const RECORD_COLUMNS: &[&str] = &[
+    "ID ученика", "ФИО", "Группа", "Эл. почта", "Тип записи", "Предмет", "Название", "Дата",
+    "Балл", "Макс. балл", "Оценка", "Статус", "Время, мин", "Пропущено уроков",
+    "Причина пропуска", "Уважительная", "Категория", "Уровень / оплата", "Комментарий",
+];
+
+/// Все записи (работы, оценки, пропуски, портфолио, поведение, питание).
 pub async fn export_activities(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ExportQuery>,
 ) -> Response {
     let mut sql = String::from(
-        "SELECT s.external_id, s.full_name, s.group_name, s.email, a.subject, a.title, a.kind,
-                a.score, a.max_score, a.grade, a.status, a.duration_min, a.occurred_at
+        "SELECT s.external_id, s.full_name, s.group_name, s.email, a.kind, a.subject, a.title,
+                a.occurred_at, a.score, a.max_score, a.grade, a.status, a.duration_min, a.amount,
+                a.reason, a.category, a.level, a.comment
          FROM activities a JOIN students s ON s.id = a.student_id WHERE 1=1",
     );
     let mut args: Vec<String> = Vec::new();
@@ -230,34 +269,59 @@ pub async fn export_activities(
         Err(e) => return err(format!("ошибка БД: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     };
     let mapped = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+        let kind: String = r.get(4)?;
+        let status: String = r.get(11)?;
+        let is_absence = kind == "absence";
         Ok(vec![
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
+            crate::labels::kind_ru(&kind).to_string(),
             r.get::<_, String>(5)?,
             r.get::<_, String>(6)?,
-            opt(r.get::<_, Option<f64>>(7)?),
-            opt(r.get::<_, Option<f64>>(8)?),
-            opt(r.get::<_, Option<i64>>(9)?),
-            r.get::<_, String>(10)?,
-            opt(r.get::<_, Option<f64>>(11)?),
-            r.get::<_, String>(12)?,
+            date_out(&r.get::<_, String>(7)?),
+            num(r.get::<_, Option<f64>>(8)?),
+            num(r.get::<_, Option<f64>>(9)?),
+            opt(r.get::<_, Option<i64>>(10)?),
+            if is_absence || kind == "portfolio" || kind == "behavior" || kind == "grade" && status == "done" {
+                String::new()
+            } else {
+                crate::labels::status_ru(&status).to_string()
+            },
+            num(r.get::<_, Option<f64>>(12)?),
+            if is_absence { num(Some(r.get::<_, f64>(13)?)) } else { String::new() },
+            r.get::<_, String>(14)?,
+            if is_absence { crate::labels::yes_no(status == "excused").to_string() } else { String::new() },
+            r.get::<_, String>(15)?,
+            r.get::<_, String>(16)?,
+            r.get::<_, String>(17)?,
         ])
     });
-    let mut rows = vec![[
-        "external_id", "full_name", "group", "email", "subject", "title", "kind",
-        "score", "max_score", "grade", "status", "duration_min", "date",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect::<Vec<_>>()];
+    let mut rows = vec![header(RECORD_COLUMNS)];
     match mapped {
         Ok(it) => rows.extend(it.filter_map(|r| r.ok())),
         Err(e) => return err(format!("ошибка БД: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     }
-    csv_response("activities", rows)
+    csv_response("записи", rows)
+}
+
+/// Пустой шаблон для импорта с примерами каждого типа записи.
+pub async fn import_template() -> Response {
+    let r = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let rows = vec![
+        header(RECORD_COLUMNS),
+        r(&["1001", "Иванов Иван", "7А", "", "Домашняя работа", "Математика", "Дроби, упр. 12", "2026-09-14", "8", "10", "", "выполнено вовремя", "35", "", "", "", "", "", ""]),
+        r(&["1001", "Иванов Иван", "7А", "", "Контрольная работа", "Алгебра", "Контрольная №1", "2026-09-20", "17", "20", "", "выполнено вовремя", "40", "", "", "", "", "", ""]),
+        r(&["1001", "Иванов Иван", "7А", "", "Оценка", "Математика", "", "2026-09-21", "", "", "5", "", "", "", "", "", "", "", ""]),
+        r(&["1001", "Иванов Иван", "7А", "", "Пропуск", "Физика", "", "2026-09-22", "", "", "", "", "", "2", "Болезнь", "да", "", "", "Справка от врача"]),
+        r(&["1001", "Иванов Иван", "7А", "", "Пропуск", "", "", "2026-09-25", "", "", "", "", "", "1", "Без уважительной причины", "нет", "", "", ""]),
+        r(&["1001", "Иванов Иван", "7А", "", "Портфолио", "", "Олимпиада по математике, призёр", "2026-10-05", "", "", "", "", "", "", "", "", "Грамота", "Региональный", "2 место"]),
+        r(&["1001", "Иванов Иван", "7А", "", "Поведение", "", "", "2026-10-07", "", "", "", "", "", "", "", "", "Замечание", "", "Разговаривал на уроке"]),
+        r(&["1001", "Иванов Иван", "7А", "", "Поведение", "", "", "2026-10-10", "", "", "", "", "", "", "", "", "Поощрение", "", "Помог с оформлением класса"]),
+        r(&["1001", "Иванов Иван", "7А", "", "Питание", "", "", "2026-10-11", "", "", "", "питался", "", "", "", "", "Обед", "Льготное", ""]),
+    ];
+    csv_response("шаблон-импорта", rows)
 }
 
 /// История ИИ-анализов.
@@ -281,15 +345,12 @@ pub async fn export_analyses(State(state): State<Arc<AppState>>) -> Response {
             r.get::<_, String>(6)?,
         ])
     });
-    let mut rows = vec![["id", "external_id", "full_name", "model", "created_at", "prompt", "answer"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()];
+    let mut rows = vec![header(&["№", "ID ученика", "ФИО", "Модель", "Дата", "Запрос", "Ответ ИИ"])];
     match mapped {
         Ok(it) => rows.extend(it.filter_map(|r| r.ok())),
         Err(e) => return err(format!("ошибка БД: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     }
-    csv_response("analyses", rows)
+    csv_response("анализы", rows)
 }
 
 // ─────────────────────────────── движок llama.cpp ───────────────────────────────

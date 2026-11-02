@@ -150,7 +150,7 @@ function setOutput(el, text, loopDetected) {
 
 // ─────────────────────────────── Вкладки ───────────────────────────────
 
-const TABS = ['dashboard', 'students', 'analyze', 'models', 'settings', 'users'];
+const TABS = ['dashboard', 'students', 'stats', 'analyze', 'models', 'settings', 'users'];
 
 function can(perm) {
   const a = state.me && state.me.account;
@@ -158,7 +158,7 @@ function can(perm) {
   return a.role === 'admin' || (a.perms || []).includes(perm);
 }
 
-const TAB_PERM = { dashboard: 'view', students: 'view', analyze: 'analyze', models: null, settings: 'models', users: 'users' };
+const TAB_PERM = { dashboard: 'view', students: 'view', stats: 'view', analyze: 'analyze', models: null, settings: 'models', users: 'users' };
 
 function tabAllowed(t) {
   const need = TAB_PERM[t];
@@ -183,6 +183,7 @@ function tab(name) {
   });
   if (name === 'dashboard') loadOverview();
   if (name === 'students') loadStudents();
+  if (name === 'stats') loadStats();
   if (name === 'analyze') { loadStudents(); syncStudentSelects(); }
   if (name === 'models') { loadModels(); loadEngine(); }
   if (name === 'settings') loadParams();
@@ -288,9 +289,13 @@ async function loadOverview() {
     const o = await api('/api/v1/overview');
     $('ovCards').innerHTML = [
       ['Учеников', o.students, 'в потоке'],
-      ['Активностей', o.activities, 'всего записей'],
-      ['Средний результат', pct(o.avg_ratio), 'по всем работам'],
-      ['Время на ученика', o.avg_minutes != null ? Math.round(o.avg_minutes) + ' мин' : '—', 'суммарно'],
+      ['Учебных записей', o.activities, 'работы, оценки, занятия'],
+      ['Средний результат', pct(o.avg_ratio), 'за работы'],
+      ['Средняя оценка', o.avg_grade != null ? (Math.round(o.avg_grade * 100) / 100).toString().replace('.', ',') : '—', 'по 5-балльной шкале'],
+      ['Пропущено уроков', o.absences, `без уважительной причины: ${o.absences_unexcused}`],
+      ['Портфолио', o.portfolio, 'достижений и грамот'],
+      ['Поведение', `${o.praises} / ${o.remarks}`, 'поощрений / замечаний'],
+      ['Питание', o.meals ? Math.round((o.meals_eaten / o.meals) * 100) + '%' : '—', 'дней, когда питались'],
     ].map(([k, v, s]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s}</div></div>`).join('');
 
     $('ovGroups').innerHTML = o.top_groups.length ? `<table><thead><tr><th>Группа</th><th class="num">Чел.</th><th class="num">Результат</th><th style="width:120px"></th></tr></thead><tbody>` +
@@ -317,8 +322,12 @@ function kindLabel(k) {
     task: 'Домашние работы',
     quiz: 'Контрольные',
     submission: 'Проекты',
-    attendance: 'Посещаемость',
-    grade: 'Итоговые оценки',
+    attendance: 'Занятия',
+    grade: 'Оценки',
+    absence: 'Пропуски',
+    portfolio: 'Портфолио',
+    behavior: 'Поведение',
+    meal: 'Питание',
   })[k] || k;
 }
 
@@ -361,17 +370,21 @@ async function loadStudents() {
     } else {
       $('studentsList').innerHTML = `<div class="list"><table>
         <thead><tr>
-          <th>Ученик</th><th>Группа</th><th>Курс</th>
-          <th class="num">Активностей</th><th class="num">Результат</th>
-          <th class="num">Время</th><th>Последняя</th><th></th>
+          <th>Ученик</th><th>Группа</th>
+          <th class="num" title="Средняя оценка">Оценка</th><th class="num">Результат</th>
+          <th class="num" title="Пропущено уроков (без уважительной причины)">Пропуски</th>
+          <th class="num">Портфолио</th><th class="num" title="Замечания и нарушения">Замечания</th>
+          <th class="num" title="Доля дней, когда питался">Питание</th><th>Последняя</th><th></th>
         </tr></thead><tbody>` +
         state.students.map((s) => `<tr>
           <td><b>${esc(s.full_name)}</b><br><span class="mono">${esc(s.external_id)}</span></td>
           <td>${esc(s.group_name) || '—'}</td>
-          <td>${s.grade ?? '—'}</td>
-          <td class="num">${s.activities}</td>
+          <td class="num">${s.avg_grade != null ? (Math.round(s.avg_grade * 10) / 10).toString().replace('.', ',') : '—'}</td>
           <td class="num">${pct(s.avg_ratio)}</td>
-          <td class="num">${s.total_minutes != null ? Math.round(s.total_minutes) + ' мин' : '—'}</td>
+          <td class="num">${s.absences}${s.absences_unexcused ? ` <span class="muted">(${s.absences_unexcused})</span>` : ''}</td>
+          <td class="num">${s.portfolio}</td>
+          <td class="num">${s.remarks}</td>
+          <td class="num">${s.meals ? Math.round((s.meals_eaten / s.meals) * 100) + '%' : '—'}</td>
           <td class="muted">${esc(fmtDate(s.last_activity))}</td>
           <td style="text-align:right;white-space:nowrap">
             <button class="b b-sm" onclick="openStudent(${s.id})">Открыть</button>
@@ -415,10 +428,12 @@ async function openStudent(id) {
       `<div style="height:${Math.round((t.count / maxRatio) * 100)}%" title="${esc(t.period)}: ${t.count}"><span>${esc(t.period.slice(5))}</span></div>`).join('') + `</div>` : '';
 
     let html = `<div class="cards">
-      <div class="card"><div class="k">Активностей</div><div class="v">${s.activities}</div></div>
-      <div class="card"><div class="k">Средний результат</div><div class="v">${pct(s.avg_ratio)}</div></div>
-      <div class="card"><div class="k">Время</div><div class="v">${s.total_minutes != null ? Math.round(s.total_minutes / 60) + ' ч' : '—'}</div></div>
-      <div class="card"><div class="k">Курс</div><div class="v">${s.grade ?? '—'}</div></div>
+      <div class="card"><div class="k">Средняя оценка</div><div class="v">${s.avg_grade != null ? (Math.round(s.avg_grade * 100) / 100).toString().replace('.', ',') : '—'}</div></div>
+      <div class="card"><div class="k">Результат за работы</div><div class="v">${pct(s.avg_ratio)}</div></div>
+      <div class="card"><div class="k">Пропущено уроков</div><div class="v">${s.absences}</div><div class="s">без уважительной причины: ${s.absences_unexcused}</div></div>
+      <div class="card"><div class="k">Портфолио</div><div class="v">${s.portfolio}</div></div>
+      <div class="card"><div class="k">Поощрений / замечаний</div><div class="v">${s.praises} / ${s.remarks}</div></div>
+      <div class="card"><div class="k">Время на работы</div><div class="v">${s.total_minutes != null ? Math.round(s.total_minutes / 60) + ' ч' : '—'}</div></div>
     </div>`;
 
     if (d.strengths.length) {
@@ -451,9 +466,10 @@ async function openStudent(id) {
 
     if (d.recent.length) {
       html += `<div class="sec"><div class="sec-t">Последние работы</div><table><thead><tr>
-        <th>Дата</th><th>Работа</th><th>Предмет</th><th class="num">Баллы</th><th>Статус</th>
+        <th>Дата</th><th>Тип</th><th>Работа</th><th>Предмет</th><th class="num">Баллы</th><th>Статус</th>
         </tr></thead><tbody>` + d.recent.slice(0, 30).map((a) => `<tr>
           <td class="muted">${esc(fmtDate(a.occurred_at))}</td>
+          <td class="muted">${esc(kindLabel(a.kind))}</td>
           <td>${esc(a.title)}</td>
           <td>${esc(a.subject)}</td>
           <td class="num">${a.score != null && a.max_score ? a.score + '/' + a.max_score : '—'}</td>
@@ -461,9 +477,11 @@ async function openStudent(id) {
         </tr>`).join('') + '</tbody></table></div>';
     }
 
+    html += studentExtras(d);
+
     html += `<div class="sec" style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="b b-p" onclick="analyzeStudent(${d.id})">Полный разбор (ИИ)</button>
-      <button class="b" onclick="askAbout(${d.id})">Задать вопрос</button>
+      <button class="b b-p" onclick="analyzeStudent(${s.id})">Полный разбор (ИИ)</button>
+      <button class="b" onclick="askAbout(${s.id})">Задать вопрос</button>
     </div>`;
 
     $('sdBody').innerHTML = html;
@@ -475,10 +493,14 @@ async function openStudent(id) {
 
 function statusTag(s) {
   const map = {
-    done: ['tag-ok', 'выполнено'],
+    done: ['tag-ok', 'выполнено вовремя'],
     late: ['tag-w', 'с опозданием'],
-    missing: ['tag-r', 'пропущено'],
+    missing: ['tag-r', 'не выполнено'],
     submitted: ['tag-ok', 'сдано'],
+    excused: ['tag-ok', 'уважительная'],
+    unexcused: ['tag-r', 'без уваж. причины'],
+    ate: ['tag-ok', 'питался'],
+    skipped: ['tag-w', 'не питался'],
   };
   const [cls, label] = map[s] || ['tag-a', s || '—'];
   return `<span class="tag ${cls}">${esc(label)}</span>`;
@@ -542,7 +564,10 @@ async function download(url) {
     }
     const blob = await r.blob();
     const cd = r.headers.get('Content-Disposition') || '';
-    const name = (cd.match(/filename="([^"]+)"/) || [])[1] || 'table.csv';
+    let name = 'table.csv';
+    const m5987 = cd.match(/filename\*=UTF-8''([^;]+)/i);
+    if (m5987) { try { name = decodeURIComponent(m5987[1]); } catch { /* оставляем имя по умолчанию */ } }
+    else { const m = cd.match(/filename="([^"]+)"/); if (m) name = m[1]; }
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = name;
@@ -846,22 +871,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('iPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
   $('iUser').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('iPass').focus(); });
 
-  // Если сессия ещё жива — сразу в приложение.
+  // Если сессия ещё жива (или включён анонимный режим) — сразу в приложение.
   try {
-    const me = await api('/api/v1/me');
-    if (!me.anonymous || localStorage.getItem('eq-token')) {
-      await boot();
-      return;
-    }
-  } catch { /* не авторизован — показываем форму входа */ }
-
-  // Без авторизации сразу показываем приложение.
-  try {
-    await api('/api/v1/overview');
-    $('login').style.display = 'none';
-    $('app').style.display = '';
-    await loadOverview();
-  } catch {
+    await api('/api/v1/me');
+    await boot();
+  } catch { /* не авторизован — показываем форму входа */
     showLogin();
   }
 });

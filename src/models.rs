@@ -84,6 +84,26 @@ pub const CATALOG: &[CatalogEntry] = &[
         min_ram_mb: 3072,
         recommended: false,
     },
+    CatalogEntry {
+        id: "gigachat3-lightning",
+        name: "GigaChat 3 Lightning (Q6_K)",
+        description: "Открытая русскоязычная модель Сбера GigaChat 3 Lightning (MoE, 10B параметров, активных ≈1.8B) от ai-sage, квантование Q6_K (~8.8 ГБ). Сильный русский язык, быстрая за счёт MoE. Нужно ≥10 ГБ свободной RAM (поднимите EDUQUERY_MEMORY_LIMIT до 12g).",
+        url: "https://huggingface.co/ai-sage/GigaChat3-10B-A1.8B-GGUF/resolve/main/GigaChat3-10B-A1.8B-q6_k.gguf",
+        size_approx: 8_782_240_064,
+        params: "10B (A1.8B)",
+        min_ram_mb: 10240,
+        recommended: false,
+    },
+    CatalogEntry {
+        id: "gigachat3.1-lightning",
+        name: "GigaChat 3.1 Lightning (Q4_K_M)",
+        description: "Обновлённая GigaChat 3.1 Lightning (MoE, 10B параметров, активных ≈1.8B) от ai-sage, компактное квантование Q4_K_M (~6.5 ГБ). Лучший вариант из GigaChat для сервера с 8–12 ГБ RAM (EDUQUERY_MEMORY_LIMIT не меньше 10g).",
+        url: "https://huggingface.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF/resolve/main/GigaChat3.1-10B-A1.8B-q4_K_M.gguf",
+        size_approx: 6_474_702_976,
+        params: "10B (A1.8B)",
+        min_ram_mb: 8192,
+        recommended: false,
+    },
 ];
 
 /// Найти запись каталога по id.
