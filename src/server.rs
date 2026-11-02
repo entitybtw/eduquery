@@ -19,7 +19,7 @@ use tower_http::trace::TraceLayer;
 use crate::analysis;
 use crate::auth::{self, Auth};
 use crate::db::Db;
-use crate::llm::{Engine, GenParams};
+use crate::llm::{ChatMessage, Engine, GenParams};
 use crate::models::{self, ModelRecord, ModelStore};
 use crate::students;
 
@@ -602,8 +602,8 @@ pub struct ChatMsg {
 }
 
 /// Собрать список сообщений из запроса.
-fn build_messages(req: &GenRequest, default_system: &str) -> Vec<llama_cpp_2::model::LlamaChatMessage> {
-    let mut msgs: Vec<llama_cpp_2::model::LlamaChatMessage> = Vec::new();
+fn build_messages(req: &GenRequest, default_system: &str) -> Vec<ChatMessage> {
+    let mut msgs: Vec<ChatMessage> = Vec::new();
 
     let sys = req
         .system
@@ -612,26 +612,19 @@ fn build_messages(req: &GenRequest, default_system: &str) -> Vec<llama_cpp_2::mo
         .unwrap_or_else(|| default_system.to_string());
 
     if !sys.trim().is_empty() {
-        if let Ok(m) = llama_cpp_2::model::LlamaChatMessage::new("system".into(), sys) {
-            msgs.push(m);
-        }
+        msgs.push(ChatMessage { role: "system".into(), content: sys });
     }
 
     if !req.messages.is_empty() {
         for m in &req.messages {
-            if let Ok(msg) = llama_cpp_2::model::LlamaChatMessage::new(m.role.clone(), m.content.clone())
-            {
-                msgs.push(msg);
-            }
+            msgs.push(ChatMessage { role: m.role.clone(), content: m.content.clone() });
         }
         return msgs;
     }
 
     if let Some(p) = &req.prompt {
         if !p.trim().is_empty() {
-            if let Ok(m) = llama_cpp_2::model::LlamaChatMessage::new("user".into(), p.clone()) {
-                msgs.push(m);
-            }
+            msgs.push(ChatMessage { role: "user".into(), content: p.clone() });
         }
     }
     msgs
@@ -710,7 +703,7 @@ async fn generate(
 
     let engine = state.engine.clone();
     let model = path.clone();
-    let result = tokio::task::spawn_blocking(move || engine.generate(&model, &msgs, &params)).await;
+    let result: Result<anyhow::Result<crate::llm::GenOutput>, String> = Ok(engine.generate(&model, &msgs, &params).await);
 
     match result {
         Ok(Ok(out)) => Json(out).into_response(),
@@ -913,7 +906,7 @@ async fn run_analysis(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let result = tokio::task::spawn_blocking(move || engine.generate(&model, &msgs, &params)).await;
+    let result: Result<anyhow::Result<crate::llm::GenOutput>, String> = Ok(engine.generate(&model, &msgs, &params).await);
 
     match result {
         Ok(Ok(out)) => {

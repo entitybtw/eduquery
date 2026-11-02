@@ -1,60 +1,40 @@
-# eduquery — сборка в одном образе.
+# eduquery — лёгкий образ. llama.cpp сюда НЕ вшит: приложение само скачивает
+# движок (llama-server) и модели из интернета в /data при первом запуске.
 #
 #   docker build -t eduquery:latest .
-#
-# Два этапа: Rust с llama.cpp (нужен clang для bindgen) → runtime с Alpine.
 
-FROM --platform=$BUILDPLATFORM rust:1.83-alpine AS build
-
-# Зависимости для сборки llama.cpp: cmake, C/C++ компилятор, clang (bindgen),
-# musl-dev — иначе не соберётся нативная часть llama.cpp.
-RUN apk add --no-cache \
-        cmake \
-        clang \
-        clang-dev \
-        build-base \
-        musl-dev \
-        linux-headers \
-        pkgconfig \
-        git
-
+FROM rust:1-bookworm AS build
 WORKDIR /src
 
 # Сначала зависимости — слой кэшируется между сборками.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src \
-    && echo 'fn main() {}' > src/main.rs \
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release \
-    && rm -rf src target/release/deps target/release/build \
-    && rm -f target/release/eduquery
+    && rm -rf src target/release/deps/eduquery* target/release/eduquery
 
 COPY src ./src
 COPY web ./web
-
-ARG VERSION=0.1.0
-RUN cargo build --release --locked \
-    && strip target/release/eduquery || true
+RUN cargo build --release --locked
 
 # ── Runtime ──
-FROM alpine:3.20
+# bookworm: glibc совместим с готовыми сборками llama.cpp (ubuntu-x64/arm64).
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache \
-        ca-certificates \
-        libgomp \
-        tzdata \
-        curl
+# libgomp1/libstdc++6/libssl3 нужны скачиваемому llama-server.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl tzdata libgomp1 libstdc++6 libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Статический бинарь + веб-интерфейс.
 COPY --from=build /src/target/release/eduquery /usr/local/bin/eduquery
 COPY --from=build /src/web /opt/eduquery/web
 
-# Каталог данных: БД и скачанные модели живут здесь.
+# /data: БД, модели и скачанный движок.
 ENV EDUQUERY_DATA_DIR=/data \
     EDUQUERY_HOST=0.0.0.0 \
     EDUQUERY_PORT=8080
 VOLUME ["/data"]
 WORKDIR /opt/eduquery
-
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

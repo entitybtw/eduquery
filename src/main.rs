@@ -1,6 +1,6 @@
 //! eduquery — локальная LLM-платформа для анализа учебной деятельности учеников.
 //!
-//! Веб-интерфейс, встроенный инференс llama.cpp (GGUF), SQLite-хранилище.
+//! Веб-интерфейс, инференс через llama-server (llama.cpp, скачивается автоматически), SQLite-хранилище.
 //! Разворачивается через Docker Compose.
 
 mod analysis;
@@ -49,7 +49,16 @@ async fn main() -> Result<()> {
         n_threads: cfg.threads(),
         ..Default::default()
     };
-    let engine = Engine::new(default_params)?;
+    let engine = Engine::new(default_params, cfg.data_dir.clone(), cfg.allow_remote_download)?;
+    // Скачиваем движок в фоне, чтобы первый запрос не ждал.
+    {
+        let e = engine.clone();
+        tokio::spawn(async move {
+            if let Err(err) = e.ensure_binary().await {
+                tracing::warn!("движок llama.cpp не подготовлен: {err:#}");
+            }
+        });
+    }
 
     // ── модели ──
     let store = Arc::new(ModelStore::new(cfg.models_dir()));

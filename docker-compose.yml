@@ -8,8 +8,8 @@
 # Логин:    ${EDUQUERY_ADMIN_USER} / ${EDUQUERY_ADMIN_PASS}
 #
 # Как это работает:
-#  - Внутри одного контейнера: Rust-сервер (axum) + SQLite + встроенный
-#    llama.cpp (инференс GGUF-моделей). Никаких внешних сервисов.
+#  - Внутри одного контейнера: Rust-сервер (axum) + SQLite; llama.cpp (llama-server)
+#    скачивается автоматически в /data/engine при первом запуске.
 #  - Модели скачиваются из интернета в /data/models и кэшируются на диске.
 #  - Данные (БД + модели) живут на ХОСТЕ в ./data, поэтому панель не теряет
 #    историю анализов при пересборке образа.
@@ -17,7 +17,7 @@
 services:
   eduquery:
     build: .
-    image: eduquery:latest
+    image: entbtw/eduquery:latest
     container_name: eduquery
     restart: unless-stopped
     ports:
@@ -36,6 +36,8 @@ services:
       EDUQUERY_ALLOW_REMOTE_DOWNLOAD: ${EDUQUERY_ALLOW_REMOTE_DOWNLOAD:-true}
       # Вход без пароля (только для локальной отладки).
       EDUQUERY_ALLOW_ANONYMOUS: ${EDUQUERY_ALLOW_ANONYMOUS:-false}
+      # Вариант движка llama.cpp: пусто = CPU, vulkan = GPU через Vulkan.
+      EDUQUERY_ENGINE_VARIANT: ${EDUQUERY_ENGINE_VARIANT:-}
       RUST_LOG: ${RUST_LOG:-eduquery=info,warn}
     volumes:
       - ./data:/data
