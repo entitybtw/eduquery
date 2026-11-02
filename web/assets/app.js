@@ -11,6 +11,13 @@ const state = {
   catalog: [],
   activeModel: '',
   currentStudent: null,
+  me: null,
+  engine: null,
+  allPerms: [],
+  editUserId: null,
+  setupDismissed: false,
+  prevEngineRunning: false,
+  prevDl: {},
   theme: localStorage.getItem('eq-theme') || 'dark',
   accent: localStorage.getItem('eq-accent') || '#7a9db8',
 };
@@ -141,17 +148,43 @@ function setOutput(el, text, loopDetected) {
 
 // ─────────────────────────────── Вкладки ───────────────────────────────
 
+const TABS = ['dashboard', 'students', 'analyze', 'models', 'settings', 'users'];
+
+function can(perm) {
+  const a = state.me && state.me.account;
+  if (!a) return false;
+  return a.role === 'admin' || (a.perms || []).includes(perm);
+}
+
+const TAB_PERM = { dashboard: 'view', students: 'view', analyze: 'analyze', models: null, settings: 'models', users: 'users' };
+
+function tabAllowed(t) {
+  const need = TAB_PERM[t];
+  return need === null || can(need);
+}
+
+function applyPerms() {
+  document.querySelectorAll('.ntb').forEach((b) => {
+    b.style.display = tabAllowed(b.dataset.tab) ? '' : 'none';
+  });
+  document.querySelectorAll('[data-perm]').forEach((el) => {
+    el.style.display = can(el.dataset.perm) ? '' : 'none';
+  });
+}
+
 function tab(name) {
+  if (!tabAllowed(name)) { toast('Нет прав для этого раздела', 'err'); return; }
   document.querySelectorAll('.ntb').forEach((b) =>
     b.classList.toggle('a', b.dataset.tab === name));
-  ['dashboard', 'students', 'analyze', 'models', 'settings'].forEach((t) => {
+  TABS.forEach((t) => {
     $('p-' + t).style.display = t === name ? '' : 'none';
   });
   if (name === 'dashboard') loadOverview();
   if (name === 'students') loadStudents();
   if (name === 'analyze') { loadStudents(); syncStudentSelects(); }
-  if (name === 'models') loadModels();
+  if (name === 'models') { loadModels(); loadEngine(); }
   if (name === 'settings') loadParams();
+  if (name === 'users') loadUsers();
 }
 
 // ─────────────────────────────── Тема ───────────────────────────────
@@ -206,11 +239,36 @@ async function doLogout() {
 
 async function boot() {
   const me = await api('/api/v1/me');
+  state.me = me;
   $('login').style.display = 'none';
   $('app').style.display = '';
   state.activeModel = me.active_model || '';
   updateActiveLabel();
-  await Promise.all([loadOverview(), loadModels()]);
+  renderMeBox();
+  applyPerms();
+
+  const first = TABS.find((t) => tabAllowed(t) && (t !== 'users'));
+  tab(can('view') ? 'dashboard' : (first || 'models'));
+  if (can('view')) await loadOverview();
+  await loadModels();
+
+  // Первый запуск: движок llama.cpp ещё не установлен.
+  await pollJobs();
+  if (state.engine && !state.engine.installed && !state.setupDismissed) {
+    if (can('models')) openSetup();
+    else toast('Движок ИИ не установлен — обратитесь к администратору', 'err');
+  }
+}
+
+function renderMeBox() {
+  const me = state.me;
+  if (!me || !me.account) { $('meBox').textContent = ''; return; }
+  const a = me.account;
+  let t = me.anonymous ? '' : a.username;
+  if (a.daily_limit > 0) t += ` · ИИ ${me.usage.day}/${a.daily_limit} за сутки`;
+  else if (a.hourly_limit > 0) t += ` · ИИ ${me.usage.hour}/${a.hourly_limit} в час`;
+  $('meBox').textContent = t;
+  $('meBox').style.display = me.anonymous ? 'none' : '';
 }
 
 function updateActiveLabel() {
@@ -431,31 +489,79 @@ function closeStudent() {
 // ─────────────────────────────── Импорт ───────────────────────────────
 
 async function importFile(input) {
-  const f = input.files[0];
-  if (!f) return;
+  const files = Array.from(input.files || []);
+  if (!files.length) return;
+  const replace = $('importReplace').checked;
+  if (replace && !confirm('Все текущие данные (ученики, активности, история анализов) будут удалены и заменены содержимым файлов. Продолжить?')) {
+    input.value = '';
+    return;
+  }
   const out = $('importResult');
   busy(out, 'Импорт…');
-  try {
-    const text = await f.text();
-    const isJson = f.name.endsWith('.json') || text.trim().startsWith('[');
-    const r = await api('/api/v1/import', {
-      method: 'POST',
-      headers: { 'Content-Type': isJson ? 'application/json' : 'text/csv' },
-      body: text,
-    });
-    out.className = 'output';
-    out.innerHTML = `<b>Готово.</b> Строк: ${r.rows_read}, новых учеников: ${r.students_created},
-      обновлено: ${r.students_updated}, записей добавлено: ${r.activities_created}.` +
-      (r.errors.length ? `<div style="margin-top:8px;color:var(--bad)">Ошибки (${r.errors.length}):<br>` +
-        r.errors.slice(0, 15).map((e) => esc(e)).join('<br>') + '</div>' : '');
-    loadStudents();
-    loadOverview();
-    toast('Импорт завершён', 'ok');
-  } catch (e) {
-    out.className = 'output';
-    out.innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';
+  let html = '';
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    try {
+      const buf = await f.arrayBuffer();
+      const head = new TextDecoder('utf-8', { fatal: false }).decode(buf.slice(0, 64)).trim();
+      const isJson = f.name.toLowerCase().endsWith('.json') || head.startsWith('[');
+      const mode = replace && i === 0 ? '?mode=replace' : '';
+      const r = await api('/api/v1/import' + mode, {
+        method: 'POST',
+        headers: { 'Content-Type': isJson ? 'application/json' : 'text/csv' },
+        body: buf,
+      });
+      html += `<div style="margin-bottom:8px"><b>${esc(f.name)}:</b> строк ${r.rows_read}, новых учеников ${r.students_created},
+        обновлено ${r.students_updated}, записей добавлено ${r.activities_created}.` +
+        (r.errors.length ? `<div style="color:var(--bad)">Ошибки (${r.errors.length}):<br>` +
+          r.errors.slice(0, 10).map((e) => esc(e)).join('<br>') + '</div>' : '') + '</div>';
+    } catch (e) {
+      html += `<div style="margin-bottom:8px;color:var(--bad)"><b>${esc(f.name)}:</b> ${esc(e.message)}</div>`;
+    }
   }
+  out.className = 'output';
+  out.innerHTML = html;
+  loadStudents();
+  loadOverview();
+  toast('Импорт завершён', 'ok');
   input.value = '';
+  $('importReplace').checked = false;
+}
+
+// ─────────────────────────────── Экспорт ───────────────────────────────
+
+async function download(url) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      let m = 'HTTP ' + r.status;
+      try { m = (await r.json()).error || m; } catch { /* не JSON */ }
+      throw new Error(m);
+    }
+    const blob = await r.blob();
+    const cd = r.headers.get('Content-Disposition') || '';
+    const name = (cd.match(/filename="([^"]+)"/) || [])[1] || 'table.csv';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  } catch (e) {
+    toast('Не удалось скачать: ' + e.message, 'err');
+  }
+}
+
+function exportUrl(name) {
+  download('/api/v1/export/' + name);
+}
+
+function exportStudents() {
+  const q = encodeURIComponent($('qStudents').value);
+  const g = encodeURIComponent($('fGroup').value);
+  const s = encodeURIComponent($('fSort').value);
+  download(`/api/v1/export/students.csv?q=${q}&group=${g}&sort=${s}`);
 }
 
 // ─────────────────────────────── Модели ───────────────────────────────
@@ -535,7 +641,10 @@ async function downloadModel(id) {
   try {
     await api('/api/v1/models/download', { method: 'POST', body: { id } });
     toast('Загрузка началась', 'ok');
+    state.prevDl[id] = 'running';
+    pollJobs();
     loadModels();
+    renderSetup();
   } catch (e) {
     toast('Ошибка: ' + e.message, 'err');
   }
@@ -549,6 +658,8 @@ async function downloadCustom() {
   try {
     await api('/api/v1/models/download/custom', { method: 'POST', body: { id, name, url } });
     toast('Загрузка началась', 'ok');
+    state.prevDl[id] = 'running';
+    pollJobs();
     loadModels();
   } catch (e) {
     toast('Ошибка: ' + e.message, 'err');
@@ -622,6 +733,11 @@ async function saveParams() {
 // ─────────────────────────────── Анализ ───────────────────────────────
 
 function requireModel() {
+  if (state.engine && !state.engine.installed) {
+    toast('Сначала установите движок llama.cpp (вкладка «Модели»)', 'err');
+    if (can('models')) openSetup();
+    return false;
+  }
   if (!state.activeModel) {
     toast('Сначала скачайте и активируйте модель во вкладке «Модели»', 'err');
     tab('models');
@@ -721,6 +837,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (e.target === $('mStudent')) closeStudent();
   });
 
+  ['mUser', 'mPass', 'mSetup'].forEach((id) => {
+    $(id).addEventListener('click', (e) => { if (e.target === $(id)) $(id).classList.remove('on'); });
+  });
+
   $('iPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
   $('iUser').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('iPass').focus(); });
 
@@ -743,3 +863,303 @@ document.addEventListener('DOMContentLoaded', async () => {
     showLogin();
   }
 });
+
+
+// ─────────────────────────────── Фоновые задачи и прогресс ───────────────────────────────
+
+let jobsTimer = null;
+
+function renderTopbar(items) {
+  const bar = $('topbar');
+  if (!items.length) {
+    bar.style.display = 'none';
+    document.body.classList.remove('has-topbar');
+    return;
+  }
+  const it = items[0];
+  const fill = $('tbFill');
+  let text = it.label;
+  if (it.total > 0) {
+    const p = Math.min(100, Math.round((it.received / it.total) * 100));
+    fill.className = '';
+    fill.style.width = p + '%';
+    text += ` — ${p}% (${fmtBytes(it.received)} / ${fmtBytes(it.total)})`;
+  } else {
+    fill.className = 'ind';
+    fill.style.width = '';
+    if (it.received) text += ` — ${fmtBytes(it.received)}`;
+  }
+  if (items.length > 1) text += ` · ещё задач: ${items.length - 1}`;
+  $('tbText').textContent = text;
+  bar.style.display = '';
+  document.body.classList.add('has-topbar');
+}
+
+async function pollJobs() {
+  clearTimeout(jobsTimer);
+  let eng = null;
+  let mod = null;
+  try { eng = await api('/api/v1/engine/status'); } catch { /* нет сессии */ }
+  try { mod = await api('/api/v1/models/status'); } catch { /* ignore */ }
+
+  const items = [];
+  if (eng) {
+    state.engine = eng;
+    const ins = eng.install || {};
+    const running = ins.status === 'running';
+    if (running) {
+      items.push({ label: 'Установка llama.cpp: ' + (ins.stage || ''), received: ins.received, total: ins.total });
+    }
+    if (state.prevEngineRunning && !running) {
+      if (ins.status === 'done') toast('Движок llama.cpp установлен', 'ok');
+      else if (ins.status === 'error') toast('Не удалось установить движок: ' + (ins.error || ''), 'err');
+      loadEngine();
+      renderSetup();
+    }
+    state.prevEngineRunning = running;
+  }
+
+  let dlFinished = false;
+  const nowDl = {};
+  ((mod && mod.downloads) || []).forEach((d) => {
+    nowDl[d.id] = d.status;
+    if (d.status === 'running') {
+      items.push({ label: 'Скачивание модели ' + d.name, received: d.received, total: d.total });
+    }
+    if (state.prevDl[d.id] === 'running' && d.status === 'done') {
+      dlFinished = true;
+      toast('Модель скачана: ' + d.name, 'ok');
+      // Первую скачанную модель сразу делаем активной.
+      if (!state.activeModel && can('models')) activateModel(d.id);
+    }
+    if (state.prevDl[d.id] === 'running' && d.status === 'error') {
+      toast('Ошибка скачивания ' + d.name + ': ' + (d.error || ''), 'err');
+    }
+  });
+  state.prevDl = nowDl;
+  if (dlFinished) { loadModels(); renderSetup(); }
+
+  renderTopbar(items);
+  if (items.length) jobsTimer = setTimeout(pollJobs, 1000);
+}
+
+// ─────────────────────────────── Движок llama.cpp ───────────────────────────────
+
+async function loadEngine() {
+  const box = $('engineBody');
+  if (!box) return;
+  try {
+    const e = await api('/api/v1/engine/status');
+    state.engine = e;
+    const ins = e.install || {};
+    const canManage = can('models');
+    if (e.installed) {
+      $('engineTag').innerHTML = '<span class="tag tag-ok">установлен</span>';
+      box.innerHTML = `<div class="muted">Версия: <code>${esc(e.version || 'своя сборка')}</code>. Хранится в ./data/engine.</div>`;
+    } else if (ins.status === 'running') {
+      $('engineTag').innerHTML = '<span class="tag tag-w">установка…</span>';
+      box.innerHTML = '<div class="busy"><div class="spin"></div>' + esc(ins.stage || 'Установка') + ' — прогресс в полосе сверху</div>';
+    } else {
+      $('engineTag').innerHTML = '<span class="tag tag-r">не установлен</span>';
+      box.innerHTML = `<p class="muted" style="margin-bottom:10px">Для работы ИИ нужен движок llama.cpp (около 25 МБ, скачивается с GitHub).</p>` +
+        (ins.status === 'error' ? `<div class="notice">Прошлая попытка не удалась: ${esc(ins.error || '')}</div>` : '') +
+        (!e.can_download ? '<div class="notice">Загрузка из сети отключена администратором.</div>' : '') +
+        (canManage && e.can_download
+          ? '<button class="b b-p" onclick="installEngine()">Установить llama.cpp</button>'
+          : (canManage ? '' : '<div class="muted">Обратитесь к администратору.</div>'));
+    }
+  } catch (err) {
+    box.innerHTML = '<span style="color:var(--bad)">' + esc(err.message) + '</span>';
+  }
+}
+
+async function installEngine() {
+  try {
+    await api('/api/v1/engine/install', { method: 'POST' });
+    toast('Установка началась', 'ok');
+    state.prevEngineRunning = true;
+    await pollJobs();
+    loadEngine();
+    renderSetup();
+  } catch (e) {
+    toast('Ошибка: ' + e.message, 'err');
+  }
+}
+
+// ─────────────────────────────── Первый запуск ───────────────────────────────
+
+function openSetup() {
+  $('mSetup').classList.add('on');
+  renderSetup();
+}
+
+function closeSetup() {
+  state.setupDismissed = true;
+  $('mSetup').classList.remove('on');
+}
+
+function recommendedModel() {
+  return state.catalog.find((c) => c.recommended) || state.catalog.find((c) => c.id === 'qwen2.5-0.5b') || state.catalog[0];
+}
+
+function renderSetup() {
+  const box = $('setupBody');
+  if (!box || !$('mSetup').classList.contains('on')) return;
+  const e = state.engine;
+  if (!e) return;
+  const ins = e.install || {};
+  const hasModel = !!state.activeModel || (state.models || []).length > 0;
+  const rec = recommendedModel();
+  const dl = Object.values(state.prevDl).includes('running');
+
+  const engStep = e.installed
+    ? '<span class="tag tag-ok">готово</span>'
+    : ins.status === 'running'
+      ? '<span class="tag tag-w">идёт установка, прогресс сверху</span>'
+      : (e.can_download
+          ? '<button class="b b-p" onclick="installEngine()">Установить</button>'
+          : '<span class="tag tag-r">загрузка отключена</span>');
+  const modStep = hasModel
+    ? '<span class="tag tag-ok">готово</span>'
+    : dl
+      ? '<span class="tag tag-w">скачивается, прогресс сверху</span>'
+      : (rec ? `<button class="b b-p" onclick="downloadModel('${esc(rec.id)}')" ${e.installed ? '' : ''}>Скачать ${esc(rec.name)} (${fmtBytes(rec.size_approx)})</button>` : '');
+
+  const allDone = e.installed && hasModel;
+  box.innerHTML = `
+    <p class="muted">Чтобы ИИ заработал, нужно установить зависимости. Всё скачивается на сервер один раз и хранится в <code>./data</code>.</p>
+    <ul class="steps">
+      <li><div class="n ${e.installed ? 'ok' : ''}">${e.installed ? '✓' : '1'}</div>
+        <div class="grow"><b>Движок llama.cpp</b><div class="muted">Программа, которая запускает модели (~25 МБ, GitHub)</div></div>${engStep}</li>
+      <li><div class="n ${hasModel ? 'ok' : ''}">${hasModel ? '✓' : '2'}</div>
+        <div class="grow"><b>Языковая модель</b><div class="muted">Можно выбрать другую во вкладке «Модели»</div></div>${modStep}</li>
+    </ul>
+    ${ins.status === 'error' ? `<div class="notice">Ошибка установки: ${esc(ins.error || '')}</div>` : ''}
+    ${allDone ? '<button class="b b-g" onclick="closeSetup()">Всё готово — закрыть</button>' : ''}`;
+}
+
+// ─────────────────────────────── Пользователи ───────────────────────────────
+
+const PERM_LABELS = {
+  view: 'Просмотр данных',
+  analyze: 'Запросы к ИИ',
+  import: 'Импорт таблиц',
+  export: 'Скачивание таблиц',
+  models: 'Модели, движок, параметры',
+  users: 'Управление пользователями',
+};
+
+async function loadUsers() {
+  try {
+    const r = await api('/api/v1/users');
+    state.allPerms = r.all_perms || [];
+    state.usersCache = r.users || [];
+    const lim = (used, l) => (l > 0 ? `${used} / ${l}` : `${used} / ∞`);
+    $('usersList').innerHTML = `<table><thead><tr>
+      <th>Логин</th><th>Роль</th><th>Права</th><th class="num">ИИ в час</th><th class="num">ИИ за 24 ч</th><th>Вход</th><th></th>
+    </tr></thead><tbody>` + state.usersCache.map((u) => `<tr>
+      <td><b>${esc(u.username)}</b> ${u.active ? '' : '<span class="tag tag-r">отключён</span>'}</td>
+      <td>${u.role === 'admin' ? '<span class="tag tag-a">админ</span>' : 'пользователь'}</td>
+      <td>${u.role === 'admin' ? '<span class="muted">все</span>' : (u.perms.map((p) => `<span class="tag">${esc(p)}</span>`).join(' ') || '<span class="muted">нет</span>')}</td>
+      <td class="num">${lim(u.used_hour, u.hourly_limit)}</td>
+      <td class="num">${lim(u.used_day, u.daily_limit)}</td>
+      <td class="muted">${esc(fmtDate(u.last_login))}</td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="b b-sm" onclick="openUser(${u.id})">Изменить</button>
+        <button class="b b-sm b-r" onclick="deleteUser(${u.id})">Удалить</button>
+      </td></tr>`).join('') + '</tbody></table>';
+  } catch (e) {
+    toast('Ошибка: ' + e.message, 'err');
+  }
+}
+
+function muRoleChanged() {
+  $('muPermsBox').style.display = $('muRole').value === 'admin' ? 'none' : '';
+}
+
+function openUser(id) {
+  const u = id ? (state.usersCache || []).find((x) => x.id === id) : null;
+  state.editUserId = u ? u.id : null;
+  $('muTitle').textContent = u ? 'Пользователь: ' + u.username : 'Новый пользователь';
+  $('muName').value = u ? u.username : '';
+  $('muName').disabled = !!u;
+  $('muPass').value = '';
+  $('muPassLbl').textContent = u ? 'Новый пароль (оставьте пустым, чтобы не менять)' : 'Пароль (минимум 6 символов)';
+  $('muRole').value = u ? u.role : 'user';
+  const current = u ? u.perms : ['view', 'analyze', 'export'];
+  const all = state.allPerms.length ? state.allPerms : Object.keys(PERM_LABELS);
+  $('muPerms').innerHTML = all.map((p) =>
+    `<label><input type="checkbox" value="${p}" ${current.includes(p) ? 'checked' : ''}> ${esc(PERM_LABELS[p] || p)}</label>`).join('');
+  $('muHour').value = u ? u.hourly_limit : 0;
+  $('muDay').value = u ? u.daily_limit : 0;
+  $('muActive').checked = u ? u.active : true;
+  $('muActiveBox').style.display = u ? '' : 'none';
+  $('muMsg').textContent = '';
+  muRoleChanged();
+  $('mUser').classList.add('on');
+}
+
+function closeUser() { $('mUser').classList.remove('on'); }
+
+async function saveUser() {
+  const perms = Array.from($('muPerms').querySelectorAll('input:checked')).map((i) => i.value);
+  const body = {
+    role: $('muRole').value,
+    perms,
+    hourly_limit: Math.max(0, +$('muHour').value || 0),
+    daily_limit: Math.max(0, +$('muDay').value || 0),
+  };
+  try {
+    if (state.editUserId) {
+      body.active = $('muActive').checked;
+      if ($('muPass').value) body.password = $('muPass').value;
+      await api('/api/v1/users/' + state.editUserId, { method: 'PUT', body });
+    } else {
+      body.username = $('muName').value.trim();
+      body.password = $('muPass').value;
+      await api('/api/v1/users', { method: 'POST', body });
+    }
+    closeUser();
+    toast('Сохранено', 'ok');
+    loadUsers();
+  } catch (e) {
+    $('muMsg').className = 'output';
+    $('muMsg').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';
+  }
+}
+
+async function deleteUser(id) {
+  const u = (state.usersCache || []).find((x) => x.id === id);
+  if (!u || !confirm('Удалить пользователя ' + u.username + '?')) return;
+  try {
+    await api('/api/v1/users/' + id, { method: 'DELETE' });
+    toast('Удалён', 'ok');
+    loadUsers();
+  } catch (e) {
+    toast('Ошибка: ' + e.message, 'err');
+  }
+}
+
+// ─────────────────────────────── Смена пароля ───────────────────────────────
+
+function openPass() {
+  if (state.me && state.me.anonymous) return;
+  $('mpOld').value = ''; $('mpNew').value = ''; $('mpMsg').textContent = '';
+  $('mPass').classList.add('on');
+}
+
+function closePass() { $('mPass').classList.remove('on'); }
+
+async function savePass() {
+  try {
+    await api('/api/v1/me/password', {
+      method: 'POST',
+      body: { old_password: $('mpOld').value, new_password: $('mpNew').value },
+    });
+    closePass();
+    toast('Пароль изменён', 'ok');
+  } catch (e) {
+    $('mpMsg').className = 'output';
+    $('mpMsg').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';
+  }
+}

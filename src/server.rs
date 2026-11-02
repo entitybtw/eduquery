@@ -5,7 +5,7 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,9 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use crate::analysis;
+use crate::admin_api;
 use crate::auth::{self, Auth};
+use crate::users::{self, User};
 use crate::db::Db;
 use crate::llm::{ChatMessage, Engine, GenParams};
 use crate::models::{self, ModelRecord, ModelStore};
@@ -53,6 +55,20 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/login", post(login))
         .route("/api/v1/logout", post(logout))
         .route("/api/v1/me", get(me))
+        .route("/api/v1/me/password", post(admin_api::change_my_password))
+        // ── пользователи ──
+        .route("/api/v1/users", get(admin_api::list_users).post(admin_api::create_user))
+        .route(
+            "/api/v1/users/{id}",
+            put(admin_api::update_user).delete(admin_api::delete_user),
+        )
+        // ── экспорт ──
+        .route("/api/v1/export/students.csv", get(admin_api::export_students))
+        .route("/api/v1/export/activities.csv", get(admin_api::export_activities))
+        .route("/api/v1/export/analyses.csv", get(admin_api::export_analyses))
+        // ── движок llama.cpp ──
+        .route("/api/v1/engine/status", get(admin_api::engine_status))
+        .route("/api/v1/engine/install", post(admin_api::engine_install))
         // ── обзор ──
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/groups", get(groups))
@@ -123,43 +139,86 @@ fn extract_token(req: &axum::http::Request<axum::body::Body>) -> Option<String> 
     None
 }
 
+/// Токен сессии, положенный middleware в extensions.
+#[derive(Clone)]
+pub struct Token(pub String);
+
+/// Какое право нужно для маршрута.
+enum Need {
+    Any,
+    Perm(&'static str),
+}
+
+fn required_perm(method: &axum::http::Method, path: &str) -> Need {
+    use axum::http::Method;
+    let read = method == Method::GET;
+    match path {
+        "/api/v1/logout" | "/api/v1/me" | "/api/v1/me/password" | "/api/v1/engine/status" => Need::Any,
+        "/api/v1/engine/install" => Need::Perm("models"),
+        "/api/v1/import" | "/api/v1/seed" => Need::Perm("import"),
+        "/api/v1/generate" => Need::Perm("analyze"),
+        "/api/v1/models/catalog" | "/api/v1/models/status" | "/api/v1/models" if read => Need::Any,
+        "/api/v1/params" if read => Need::Any,
+        "/api/v1/params" => Need::Perm("models"),
+        p if p.starts_with("/api/v1/users") => Need::Perm("users"),
+        p if p.starts_with("/api/v1/export/") => Need::Perm("export"),
+        p if p.starts_with("/api/v1/analyze/") => Need::Perm("analyze"),
+        p if p.starts_with("/api/v1/models") => Need::Perm("models"),
+        p if p.starts_with("/api/v1/settings/") && read => Need::Any,
+        p if p.starts_with("/api/v1/settings/") => Need::Perm("users"),
+        _ => Need::Perm("view"),
+    }
+}
+
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let path = req.uri().path();
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
 
     // Публичные маршруты.
     if path == "/health"
         || path == "/api/v1/login"
-        || !state.auth.require_auth()
         || path.starts_with("/assets/")
         || path == "/favicon.ico"
     {
         return next.run(req).await;
     }
 
-    let token = match extract_token(&req) {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "требуется авторизация"})),
-            )
-                .into_response();
+    let (user, token) = if !state.auth.require_auth() {
+        (User::anonymous(), String::new())
+    } else {
+        let Some(token) = extract_token(&req) else {
+            return json_err("требуется авторизация", StatusCode::UNAUTHORIZED);
+        };
+        let Some(username) = state.auth.validate(&token) else {
+            return json_err("сессия истекла, войдите заново", StatusCode::UNAUTHORIZED);
+        };
+        match users::get_by_name(&state.db, &username) {
+            Some(u) if u.active => (u, token),
+            _ => return json_err("учётная запись недоступна", StatusCode::UNAUTHORIZED),
         }
     };
 
-    if !state.auth.validate(&token) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "сессия истекла, войдите заново"})),
-        )
-            .into_response();
+    if let Need::Perm(p) = required_perm(&method, &path) {
+        if !user.has(p) {
+            return json_err(
+                &format!("недостаточно прав (нужно право «{p}»)"),
+                StatusCode::FORBIDDEN,
+            );
+        }
+        // Запросы к ИИ учитываются в лимитах пользователя.
+        if p == "analyze" && method == axum::http::Method::POST {
+            if let Err(msg) = users::check_and_record(&state.db, &user) {
+                return json_err(&msg, StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
     }
 
-    req.extensions_mut().insert(token);
+    req.extensions_mut().insert(Token(token));
+    req.extensions_mut().insert(user);
     next.run(req).await
 }
 
@@ -183,8 +242,8 @@ async fn login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginReq>,
 ) -> Response {
-    match state.auth.login(&req.username, &req.password) {
-        Some(token) => {
+    match state.auth.login(&state.db, &req.username, &req.password) {
+        Ok(token) => {
             // Сохраняем сессию, чтобы пережить рестарт.
             let exp = std::time::SystemTime::now() + std::time::Duration::from_secs(60 * 60 * 24);
             let _ = auth::persist_session(&state.db, &token, &req.username, exp);
@@ -199,15 +258,11 @@ async fn login(
             }
             (headers, Json(json!({"status": "ok", "token": token}))).into_response()
         }
-        None => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "неверный логин или пароль"})),
-        )
-            .into_response(),
+        Err(msg) => (StatusCode::UNAUTHORIZED, Json(json!({"error": msg}))).into_response(),
     }
 }
 
-async fn logout(State(state): State<Arc<AppState>>, Extension(token): Extension<String>) -> Response {
+async fn logout(State(state): State<Arc<AppState>>, Extension(Token(token)): Extension<Token>) -> Response {
     state.auth.logout(&token);
     let _ = auth::drop_session(&state.db, &token);
     let mut headers = axum::http::HeaderMap::new();
@@ -218,13 +273,21 @@ async fn logout(State(state): State<Arc<AppState>>, Extension(token): Extension<
     (headers, Json(json!({"status": "ok"}))).into_response()
 }
 
-async fn me(State(state): State<Arc<AppState>>, Extension(token): Extension<String>) -> Response {
+async fn me(
+    State(state): State<Arc<AppState>>,
+    Extension(Token(token)): Extension<Token>,
+    Extension(user): Extension<User>,
+) -> Response {
+    let (used_hour, used_day) = users::usage(&state.db, user.id);
     Json(json!({
         "anonymous": !state.auth.require_auth(),
-        "user": state.auth.username(),
+        "user": user.username,
+        "account": user,
+        "usage": {"hour": used_hour, "day": used_day},
         "token": token,
         "active_model": state.engine.active_model(),
         "loaded_models": state.engine.loaded_models(),
+        "engine_installed": state.engine.installed(),
     }))
     .into_response()
 }
@@ -314,9 +377,17 @@ async fn seed_demo(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+#[derive(Deserialize)]
+struct ImportQuery {
+    /// "replace" — удалить все текущие данные перед импортом.
+    #[serde(default)]
+    mode: String,
+}
+
 /// Импорт: JSON-массив, CSV-файл или сырой CSV-текст.
 async fn import_data(
     State(state): State<Arc<AppState>>,
+    Query(iq): Query<ImportQuery>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -326,10 +397,17 @@ async fn import_data(
         .unwrap_or("")
         .to_string();
 
+    // UTF-8, а если не получилось — Windows-1251 (Excel в русской локали).
     let text = match String::from_utf8(body.to_vec()) {
         Ok(t) => t,
-        Err(_) => return json_err("файл не в UTF-8", StatusCode::BAD_REQUEST),
+        Err(_) => encoding_rs::WINDOWS_1251.decode(&body).0.into_owned(),
     };
+
+    if iq.mode == "replace" {
+        if let Err(e) = students::clear_all(&state.db) {
+            return json_err(&format!("не удалось очистить данные: {e}"), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
 
     // JSON-массив объектов.
     if ct.contains("json") || text.trim_start().starts_with('[') {

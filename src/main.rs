@@ -12,6 +12,8 @@ mod models;
 mod seed;
 mod server;
 mod students;
+mod users;
+mod admin_api;
 
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -50,25 +52,13 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let engine = Engine::new(default_params, cfg.data_dir.clone(), cfg.allow_remote_download)?;
-    // Скачиваем движок в фоне, чтобы первый запрос не ждал.
-    {
-        let e = engine.clone();
-        tokio::spawn(async move {
-            if let Err(err) = e.ensure_binary().await {
-                tracing::warn!("движок llama.cpp не подготовлен: {err:#}");
-            }
-        });
-    }
 
     // ── модели ──
     let store = Arc::new(ModelStore::new(cfg.models_dir()));
 
     // ── авторизация ──
-    let auth = Arc::new(auth::Auth::new(
-        &cfg.admin_user,
-        &cfg.admin_pass,
-        cfg.allow_anonymous,
-    ));
+    users::ensure_admin(&db, &cfg.admin_user, &cfg.admin_pass)?;
+    let auth = Arc::new(auth::Auth::new(cfg.allow_anonymous));
     auth::restore_sessions(&db, &auth)?;
 
     // ── состояние ──

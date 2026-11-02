@@ -397,17 +397,36 @@ pub struct ImportRow {
     #[serde(alias = "type", alias = "тип", alias = "kind")]
     pub kind: Option<String>,
     #[serde(alias = "score", alias = "балл", alias = "оценка")]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     pub score: Option<f64>,
     #[serde(alias = "max_score", alias = "макс_балл", alias = "max")]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     pub max_score: Option<f64>,
     #[serde(alias = "grade", alias = "оценка_итог")]
+    #[serde(default, deserialize_with = "de_opt_i64")]
     pub grade: Option<i64>,
     #[serde(alias = "status", alias = "статус")]
     pub status: Option<String>,
     #[serde(alias = "duration", alias = "длительность", alias = "minutes")]
+    #[serde(default, deserialize_with = "de_opt_f64")]
     pub duration_min: Option<f64>,
     #[serde(alias = "date", alias = "дата", alias = "occurred_at", alias = "timestamp")]
     pub occurred_at: Option<String>,
+}
+
+fn de_opt_f64<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<f64>, D::Error> {
+    Ok(match Option::<Value>::deserialize(d)? {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => {
+            let t = s.trim().replace(',', ".");
+            if t.is_empty() { None } else { t.parse().ok() }
+        }
+        _ => None,
+    })
+}
+
+fn de_opt_i64<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<i64>, D::Error> {
+    de_opt_f64(d).map(|v| v.map(|x| x.round() as i64))
 }
 
 /// Результат импорта.
@@ -422,7 +441,12 @@ pub struct ImportResult {
 
 /// Импортировать CSV. Определяет, есть ли в файле идентификатор ученика.
 pub fn import_csv(db: &Db, content: &str) -> Result<ImportResult> {
+    let content = content.trim_start_matches('\u{feff}');
+    // Excel в русской локали сохраняет CSV с «;».
+    let first = content.lines().next().unwrap_or("");
+    let delim = if first.matches(';').count() > first.matches(',').count() { b';' } else { b',' };
     let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delim)
         .flexible(true)
         .trim(csv::Trim::All)
         .from_reader(content.as_bytes());
@@ -652,4 +676,13 @@ fn normalize_date(s: &str) -> String {
 
 fn chrono_now() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Удалить все данные об учениках (для режима «заменить»).
+pub fn clear_all(db: &Db) -> Result<()> {
+    let conn = db.conn();
+    conn.execute_batch(
+        "DELETE FROM analyses; DELETE FROM activities; DELETE FROM students;",
+    )?;
+    Ok(())
 }

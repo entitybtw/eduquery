@@ -11,26 +11,20 @@ use crate::db::Db;
 /// Сессия пользователя.
 #[derive(Debug, Clone)]
 pub struct Session {
-    /// Логин пользователя (для аудита и отображения).
-    #[allow(dead_code)]
     pub username: String,
     pub expires_at: SystemTime,
 }
 
-/// Менеджер сессий.
+/// Менеджер сессий. Учётные записи живут в таблице `users`.
 pub struct Auth {
-    username: String,
-    password: String,
     allow_anonymous: bool,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     ttl: Duration,
 }
 
 impl Auth {
-    pub fn new(username: &str, password: &str, allow_anonymous: bool) -> Self {
+    pub fn new(allow_anonymous: bool) -> Self {
         Self {
-            username: username.to_string(),
-            password: password.to_string(),
             allow_anonymous,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ttl: Duration::from_secs(60 * 60 * 24),
@@ -38,48 +32,38 @@ impl Auth {
     }
 
     /// Проверить логин/пароль и выдать токен.
-    pub fn login(&self, user: &str, pass: &str) -> Option<String> {
-        if user == self.username && pass == self.password {
-            let token = gen_token();
-            let session = Session {
-                username: user.to_string(),
-                expires_at: SystemTime::now() + self.ttl,
-            };
-            let mut s = self.sessions.lock().unwrap();
-            s.retain(|_, v| v.expires_at > SystemTime::now());
-            s.insert(token.clone(), session);
-            return Some(token);
-        }
-        None
+    pub fn login(&self, db: &Db, user: &str, pass: &str) -> Result<String, String> {
+        let u = crate::users::authenticate(db, user, pass)?;
+        let token = gen_token();
+        let session = Session {
+            username: u.username,
+            expires_at: SystemTime::now() + self.ttl,
+        };
+        let mut s = self.sessions.lock().unwrap();
+        s.retain(|_, v| v.expires_at > SystemTime::now());
+        s.insert(token.clone(), session);
+        Ok(token)
     }
 
     pub fn logout(&self, token: &str) {
         self.sessions.lock().unwrap().remove(token);
     }
 
-    /// Проверить токен.
-    pub fn validate(&self, token: &str) -> bool {
-        if self.allow_anonymous && !token.is_empty() {
-            return true;
-        }
+    /// Проверить токен; возвращает логин владельца сессии.
+    pub fn validate(&self, token: &str) -> Option<String> {
         let mut s = self.sessions.lock().unwrap();
         match s.get(token) {
-            Some(sess) if sess.expires_at > SystemTime::now() => true,
+            Some(sess) if sess.expires_at > SystemTime::now() => Some(sess.username.clone()),
             Some(_) => {
                 s.remove(token);
-                false
+                None
             }
-            None => false,
+            None => None,
         }
     }
 
     pub fn require_auth(&self) -> bool {
         !self.allow_anonymous
-    }
-
-    /// Логин текущего пользователя.
-    pub fn username(&self) -> &str {
-        &self.username
     }
 }
 

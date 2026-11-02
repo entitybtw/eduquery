@@ -90,6 +90,26 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_an_student ON analyses(student_id);
 
+            CREATE TABLE IF NOT EXISTS users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                role          TEXT NOT NULL DEFAULT 'user',   -- admin | user
+                perms         TEXT NOT NULL DEFAULT '',       -- через запятую: view,analyze,import,export,models,users
+                daily_limit   INTEGER NOT NULL DEFAULT 0,     -- запросов к ИИ за 24 ч (0 = без лимита)
+                hourly_limit  INTEGER NOT NULL DEFAULT 0,     -- запросов к ИИ за час (0 = без лимита)
+                active        INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                last_login    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS usage_log (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id  INTEGER NOT NULL,
+                at       TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_user_at ON usage_log(user_id, at);
+
             CREATE TABLE IF NOT EXISTS sessions (
                 token      TEXT PRIMARY KEY,
                 username   TEXT NOT NULL,

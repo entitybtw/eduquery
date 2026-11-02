@@ -4,10 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>eduquery</title>
-<meta name="app-version" content="0.1.0">
+<meta name="app-version" content="0.0.2">
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
+
+<!-- Полоса прогресса сверху: установка движка и скачивание моделей -->
+<div id="topbar" style="display:none">
+  <div class="tb-bar"><i id="tbFill"></i></div>
+  <div class="tb-text" id="tbText"></div>
+</div>
 
 <!-- ══════════════ Экран входа ══════════════ -->
 <div id="login" class="login-wrap">
@@ -32,9 +38,11 @@
         <div class="ntb" data-tab="analyze" onclick="tab('analyze')">Анализ ИИ</div>
         <div class="ntb" data-tab="models" onclick="tab('models')">Модели</div>
         <div class="ntb" data-tab="settings" onclick="tab('settings')">Настройки</div>
+        <div class="ntb" data-tab="users" onclick="tab('users')" id="tabUsers" style="display:none">Пользователи</div>
       </div>
       <div class="st">
         <span>Модель: <b id="activeModel">не выбрана</b></span>
+        <span id="meBox" title="Нажмите, чтобы сменить пароль" onclick="openPass()" style="cursor:pointer"></span>
         <button class="b" onclick="cycleTheme()" title="Тема">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
         </button>
@@ -86,15 +94,20 @@
           <option value="recent">По последней активности</option>
         </select>
         <button class="b" onclick="loadStudents()">Обновить</button>
+        <button class="b" data-perm="export" onclick="exportStudents()" title="Скачать таблицу ровно с текущим поиском, фильтром и сортировкой">Скачать таблицу (CSV)</button>
+        <button class="b" data-perm="export" onclick="exportUrl('activities.csv')" title="Все записи активностей. Файл можно загрузить обратно через импорт">Скачать все записи (CSV)</button>
       </div>
       <div id="studentsList"></div>
-      <div class="sh"><span class="sh-t">Импорт данных</span>
-        <button class="b" onclick="document.getElementById('importFile').click()">Загрузить CSV / JSON</button>
-        <input type="file" id="importFile" accept=".csv,.json,.txt" style="display:none" onchange="importFile(this)">
+      <div class="sh" data-perm="import"><span class="sh-t">Импорт данных</span>
+        <button class="b b-p" onclick="document.getElementById('importFile').click()">Загрузить таблицы (CSV / JSON)</button>
+        <input type="file" id="importFile" accept=".csv,.json,.txt" multiple style="display:none" onchange="importFile(this)">
+        <label class="muted" style="display:flex;gap:6px;align-items:center;cursor:pointer">
+          <input type="checkbox" id="importReplace"> заменить все текущие данные
+        </label>
       </div>
-      <div class="panel">
+      <div class="panel" data-perm="import">
         <h3>Формат файла</h3>
-        <p class="muted">CSV с заголовками. Обязательные: <code>external_id</code> или <code>full_name</code>.
+        <p class="muted">Можно выбрать сразу несколько файлов. Разделитель «,» или «;», кодировка UTF-8 или Windows-1251. CSV с заголовками. Обязательные: <code>external_id</code> или <code>full_name</code>.
         Остальные колонки распознаются по синонимам: <code>subject</code>/<code>предмет</code>, <code>title</code>/<code>задание</code>,
         <code>score</code>/<code>балл</code>, <code>max_score</code>, <code>date</code>/<code>дата</code>, <code>group</code>/<code>группа</code>.</p>
         <pre class="code">external_id,full_name,group,subject,title,score,max_score,date
@@ -116,7 +129,9 @@ STU-1001,Иванов Иван,ИП-21,Математика,Домашняя р�
 
     <!-- ─────── Анализ ИИ ─────── -->
     <div id="p-analyze" style="display:none">
-      <div class="sh"><span class="sh-t">Анализ с ИИ</span></div>
+      <div class="sh"><span class="sh-t">Анализ с ИИ</span>
+        <button class="b" data-perm="export" onclick="exportUrl('analyses.csv')">Скачать историю анализов (CSV)</button>
+      </div>
       <div class="grid2">
         <div class="panel">
           <h3>Разбор ученика</h3>
@@ -155,6 +170,14 @@ STU-1001,Иванов Иван,ИП-21,Математика,Домашняя р�
         <button class="b" onclick="loadModels()">Обновить</button>
       </div>
 
+      <div class="panel" id="enginePanel">
+        <div class="panel-h">
+          <h3>Движок llama.cpp</h3>
+          <span id="engineTag"></span>
+        </div>
+        <div id="engineBody"></div>
+      </div>
+
       <div class="panel">
         <div class="panel-h">
           <h3>Каталог GGUF-моделей</h3>
@@ -177,6 +200,23 @@ STU-1001,Иванов Иван,ИП-21,Математика,Домашняя р�
       <div class="panel">
         <h3>Установленные модели</h3>
         <div id="modelList"></div>
+      </div>
+    </div>
+
+    <!-- ─────── Пользователи ─────── -->
+    <div id="p-users" style="display:none">
+      <div class="sh">
+        <span class="sh-t">Пользователи и права</span>
+        <button class="b" onclick="loadUsers()">Обновить</button>
+        <button class="b b-p" onclick="openUser()">Добавить пользователя</button>
+      </div>
+      <div class="panel">
+        <div id="usersList"></div>
+        <div class="hint">
+          Права: <b>view</b> — просмотр данных, <b>analyze</b> — запросы к ИИ, <b>import</b> — загрузка таблиц,
+          <b>export</b> — скачивание таблиц, <b>models</b> — модели, движок и параметры генерации, <b>users</b> — управление пользователями.
+          Лимиты считаются по запросам к ИИ за скользящий час и за 24 часа.
+        </div>
       </div>
     </div>
 
@@ -216,6 +256,49 @@ STU-1001,Иванов Иван,ИП-21,Математика,Домашняя р�
         </div>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ─────── Модальные окна ─────── -->
+<div id="mUser" class="mbg">
+  <div class="md" onclick="event.stopPropagation()">
+    <div class="md-h"><h2 id="muTitle">Пользователь</h2><button class="b" onclick="closeUser()">Закрыть</button></div>
+    <div class="fg"><label>Логин</label><input id="muName" autocomplete="off"></div>
+    <div class="fg"><label id="muPassLbl">Пароль (минимум 6 символов)</label><input id="muPass" type="password" autocomplete="new-password"></div>
+    <div class="fg"><label>Роль</label>
+      <select id="muRole" onchange="muRoleChanged()">
+        <option value="user">Пользователь (права выбираются)</option>
+        <option value="admin">Администратор (все права)</option>
+      </select>
+    </div>
+    <div class="fg" id="muPermsBox">
+      <label>Права</label>
+      <div id="muPerms" class="perms"></div>
+    </div>
+    <div class="row3">
+      <div class="fg"><label>Лимит запросов к ИИ в час (0 = без лимита)</label><input id="muHour" type="number" min="0" value="0"></div>
+      <div class="fg"><label>Лимит запросов к ИИ за 24 часа (0 = без лимита)</label><input id="muDay" type="number" min="0" value="0"></div>
+    </div>
+    <div class="fg" id="muActiveBox"><label><input type="checkbox" id="muActive" checked style="width:auto"> Учётная запись активна</label></div>
+    <button class="b b-p" onclick="saveUser()">Сохранить</button>
+    <div id="muMsg" class="output"></div>
+  </div>
+</div>
+
+<div id="mPass" class="mbg">
+  <div class="md" onclick="event.stopPropagation()">
+    <div class="md-h"><h2>Смена пароля</h2><button class="b" onclick="closePass()">Закрыть</button></div>
+    <div class="fg"><label>Текущий пароль</label><input id="mpOld" type="password" autocomplete="current-password"></div>
+    <div class="fg"><label>Новый пароль</label><input id="mpNew" type="password" autocomplete="new-password"></div>
+    <button class="b b-p" onclick="savePass()">Сменить</button>
+    <div id="mpMsg" class="output"></div>
+  </div>
+</div>
+
+<div id="mSetup" class="mbg">
+  <div class="md" onclick="event.stopPropagation()">
+    <div class="md-h"><h2>Первый запуск</h2><button class="b" onclick="closeSetup()">Позже</button></div>
+    <div id="setupBody"></div>
   </div>
 </div>
 

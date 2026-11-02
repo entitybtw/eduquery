@@ -75,8 +75,21 @@ struct Running {
     port: u16,
 }
 
+/// Состояние установки движка (для прогресс-бара в UI).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct InstallState {
+    /// idle | running | done | error
+    pub status: String,
+    /// Что сейчас происходит: «Поиск релиза», «Скачивание», «Распаковка».
+    pub stage: String,
+    pub received: u64,
+    pub total: u64,
+    pub error: Option<String>,
+}
+
 pub struct Engine {
     data_dir: PathBuf,
+    install: Mutex<InstallState>,
     allow_download: bool,
     http: reqwest::Client,
     default_params: GenParams,
@@ -94,6 +107,7 @@ impl Engine {
             .build()?;
         Ok(Arc::new(Self {
             data_dir,
+            install: Mutex::new(InstallState { status: "idle".into(), ..Default::default() }),
             allow_download,
             http,
             default_params,
@@ -120,15 +134,70 @@ impl Engine {
         self.engine_dir().join("llama-server")
     }
 
-    /// Убедиться, что бинарь llama-server есть; при отсутствии — скачать.
-    pub async fn ensure_binary(&self) -> Result<PathBuf> {
-        let bin = self.server_bin();
-        if bin.exists() {
-            return Ok(bin);
+    fn marker(&self) -> PathBuf {
+        self.engine_dir().join(".installed")
+    }
+
+    /// Движок установлен (или указан свой через EDUQUERY_LLAMA_SERVER).
+    pub fn installed(&self) -> bool {
+        if std::env::var("EDUQUERY_LLAMA_SERVER").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            return self.server_bin().exists();
         }
+        self.marker().exists() && self.server_bin().exists()
+    }
+
+    /// Снимок для /api/v1/engine/status.
+    pub fn install_status(&self) -> serde_json::Value {
+        let st = self.install.lock().unwrap().clone();
+        let version = std::fs::read_to_string(self.marker()).unwrap_or_default();
+        serde_json::json!({
+            "installed": self.installed(),
+            "version": version.trim(),
+            "can_download": self.allow_download,
+            "install": st,
+        })
+    }
+
+    /// Запустить установку в фоне. Err — почему не запустили.
+    pub fn start_install(self: &Arc<Self>) -> std::result::Result<(), String> {
         if !self.allow_download {
-            bail!("llama-server не найден ({}), а скачивание отключено", bin.display());
+            return Err("загрузка из сети отключена (EDUQUERY_ALLOW_REMOTE_DOWNLOAD=false)".into());
         }
+        {
+            let mut st = self.install.lock().unwrap();
+            if st.status == "running" {
+                return Err("установка уже идёт".into());
+            }
+            *st = InstallState {
+                status: "running".into(),
+                stage: "Поиск релиза llama.cpp".into(),
+                ..Default::default()
+            };
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            match this.install_inner().await {
+                Ok(()) => {
+                    let mut st = this.install.lock().unwrap();
+                    st.status = "done".into();
+                    st.stage = "Готово".into();
+                }
+                Err(e) => {
+                    tracing::error!("установка движка не удалась: {e:#}");
+                    let mut st = this.install.lock().unwrap();
+                    st.status = "error".into();
+                    st.error = Some(format!("{e:#}"));
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn set_stage(&self, stage: &str) {
+        self.install.lock().unwrap().stage = stage.to_string();
+    }
+
+    async fn find_asset(&self) -> Result<(String, String)> {
         let arch = match std::env::consts::ARCH {
             "x86_64" => "x64",
             "aarch64" => "arm64",
@@ -143,46 +212,149 @@ impl Engine {
             format!("bin-ubuntu-{variant}-{arch}.tar.gz")
         };
 
-        tracing::info!("скачиваю движок llama.cpp ({suffix})…");
-        let releases: serde_json::Value = self
-            .http
-            .get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10")
-            .send()
-            .await
-            .context("не удалось запросить список релизов llama.cpp")?
-            .error_for_status()?
-            .json()
-            .await?;
-        let url = releases
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|r| r["assets"].as_array().into_iter().flatten())
-            .find(|a| {
-                a["name"]
-                    .as_str()
-                    .map(|n| n.starts_with("llama-") && n.ends_with(&suffix))
-                    .unwrap_or(false)
-            })
-            .and_then(|a| a["browser_download_url"].as_str().map(str::to_string))
-            .ok_or_else(|| anyhow!("в релизах llama.cpp нет сборки «{suffix}»"))?;
+        let mut last_err = anyhow!("нет ответа от GitHub");
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+            }
+            let res: Result<serde_json::Value> = async {
+                Ok(self
+                    .http
+                    .get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10")
+                    .timeout(Duration::from_secs(30))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?)
+            }
+            .await;
+            match res {
+                Ok(releases) => {
+                    let found = releases
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|r| r["assets"].as_array().into_iter().flatten())
+                        .find(|a| {
+                            a["name"]
+                                .as_str()
+                                .map(|n| n.starts_with("llama-") && n.ends_with(&suffix))
+                                .unwrap_or(false)
+                        });
+                    return match found {
+                        Some(a) => Ok((
+                            a["browser_download_url"].as_str().unwrap_or_default().to_string(),
+                            a["name"].as_str().unwrap_or_default().to_string(),
+                        )),
+                        None => Err(anyhow!("в релизах llama.cpp нет сборки «{suffix}»")),
+                    };
+                }
+                Err(e) => last_err = e.context("не удалось получить список релизов llama.cpp"),
+            }
+        }
+        Err(last_err)
+    }
 
-        let bytes = self
-            .http
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await
-            .context("ошибка загрузки архива llama.cpp")?;
+    /// Скачать файл с докачкой при обрывах, отдавая прогресс в `install`.
+    async fn download_resumable(&self, url: &str, dest: &Path) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let mut failures = 0u32;
+        let mut total = 0u64;
+        loop {
+            let have = tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0);
+            let mut req = self.http.get(url);
+            if have > 0 {
+                req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+            }
+            let attempt: Result<()> = async {
+                let resp = req.send().await?;
+                let status = resp.status();
+                if status.as_u16() == 416 {
+                    return Ok(()); // уже скачано целиком
+                }
+                if !status.is_success() {
+                    bail!("сервер вернул {status}");
+                }
+                let resumed = status.as_u16() == 206;
+                let mut received = if resumed { have } else { 0 };
+                if resumed {
+                    // Content-Range: bytes a-b/total
+                    if let Some(t) = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.rsplit('/').next())
+                        .and_then(|v| v.parse::<u64>().ok())
+                    {
+                        total = t;
+                    }
+                } else {
+                    total = resp.content_length().unwrap_or(0);
+                }
+                let mut file = if resumed {
+                    tokio::fs::OpenOptions::new().append(true).open(dest).await?
+                } else {
+                    tokio::fs::File::create(dest).await?
+                };
+                {
+                    let mut st = self.install.lock().unwrap();
+                    st.received = received;
+                    st.total = total;
+                }
+                let mut stream = resp.bytes_stream();
+                loop {
+                    let next = tokio::time::timeout(Duration::from_secs(30), stream.next())
+                        .await
+                        .map_err(|_| anyhow!("таймаут: нет данных 30 секунд"))?;
+                    let Some(chunk) = next else { break };
+                    let chunk = chunk?;
+                    file.write_all(&chunk).await?;
+                    received += chunk.len() as u64;
+                    self.install.lock().unwrap().received = received;
+                }
+                file.flush().await?;
+                Ok(())
+            }
+            .await;
 
+            let size = tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0);
+            match attempt {
+                Ok(()) if total == 0 || size >= total => return Ok(()),
+                Ok(()) => {} // поток закончился раньше времени — докачиваем
+                Err(e) => {
+                    tracing::warn!("обрыв загрузки движка: {e:#}");
+                    if failures >= 15 {
+                        return Err(e.context("не удалось скачать движок после нескольких попыток"));
+                    }
+                }
+            }
+            failures += 1;
+            if failures > 15 {
+                bail!("не удалось скачать движок полностью");
+            }
+            self.set_stage(&format!("Обрыв связи, повторная попытка {failures}…"));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            self.set_stage("Скачивание llama.cpp");
+        }
+    }
+
+    async fn install_inner(&self) -> Result<()> {
         let dir = self.engine_dir();
+        tokio::fs::create_dir_all(&dir).await?;
+        let (url, name) = self.find_asset().await?;
+        tracing::info!("скачиваю движок llama.cpp: {name}");
+        self.set_stage("Скачивание llama.cpp");
+        let part = dir.join("download.part");
+        let _ = tokio::fs::remove_file(&part).await;
+        self.download_resumable(&url, &part).await?;
+
+        self.set_stage("Распаковка");
         let unpack_dir = dir.clone();
+        let archive = part.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            std::fs::create_dir_all(&unpack_dir)?;
-            let gz = flate2::read::GzDecoder::new(&bytes[..]);
-            let mut ar = tar::Archive::new(gz);
+            let file = std::fs::File::open(&archive)?;
+            let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(file));
             for entry in ar.entries()? {
                 let mut entry = entry?;
                 // Отбрасываем верхний каталог архива (llama-bXXXX/).
@@ -195,12 +367,14 @@ impl Engine {
             Ok(())
         })
         .await??;
+        let _ = tokio::fs::remove_file(&part).await;
 
-        if !bin.exists() {
+        if !dir.join("llama-server").exists() {
             bail!("в архиве llama.cpp не оказалось llama-server");
         }
+        tokio::fs::write(self.marker(), &name).await?;
         tracing::info!("движок llama.cpp установлен в {}", dir.display());
-        Ok(bin)
+        Ok(())
     }
 
     /// Выгрузить модель (остановить llama-server, если грузилась именно она).
@@ -256,7 +430,10 @@ impl Engine {
         *slot = None;
         *self.loaded.lock().unwrap() = None;
 
-        let bin = self.ensure_binary().await?;
+        if !self.installed() {
+            bail!("движок llama.cpp не установлен — установите его кнопкой «Установить» в веб-интерфейсе");
+        }
+        let bin = self.server_bin();
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0")?;
             l.local_addr()?.port()

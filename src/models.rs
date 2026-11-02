@@ -257,10 +257,15 @@ impl ModelStore {
         drop(file);
 
         // Проверяем GGUF-магию.
-        let magic = tokio::fs::read(&tmp)
-            .await
-            .context("ошибка чтения скачанного файла")?;
-        if magic.len() < 4 || &magic[0..4] != b"GGUF" {
+        let mut magic = [0u8; 4];
+        {
+            use tokio::io::AsyncReadExt;
+            let mut f = tokio::fs::File::open(&tmp)
+                .await
+                .context("ошибка чтения скачанного файла")?;
+            let _ = f.read_exact(&mut magic).await;
+        }
+        if &magic != b"GGUF" {
             let _ = tokio::fs::remove_file(&tmp).await;
             self.update_download(id, |d| {
                 d.status = "error".into();
@@ -284,9 +289,18 @@ impl ModelStore {
     /// sha256 файла.
     pub fn sha256(path: &Path) -> Result<String> {
         use sha2::{Digest, Sha256};
-        let data = std::fs::read(path).with_context(|| format!("не удалось прочитать {}", path.display()))?;
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)
+            .with_context(|| format!("не удалось прочитать {}", path.display()))?;
         let mut h = Sha256::new();
-        h.update(&data);
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
         Ok(format!("{:x}", h.finalize()))
     }
 }

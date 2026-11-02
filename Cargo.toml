@@ -1,6 +1,6 @@
 [package]
 name = "eduquery"
-version = "0.1.0"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Локальная LLM-платформа для анализа учебной деятельности учеников"
@@ -33,6 +33,7 @@ tar = "0.4"
 encoding_rs = "0.8"
 csv = "1"
 sha2 = "0.10"
+argon2 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [profile.release]
