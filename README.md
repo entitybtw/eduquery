@@ -1,169 +1,169 @@
 # eduquery
 
-Локальная LLM-платформа для анализа учебной деятельности учеников.
-Веб-панель + SQLite + языковая модель, которая работает **у вас на сервере**:
-данные учеников никуда не уходят.
+A local LLM platform for analysing students' academic performance.
+Web panel + SQLite + a language model that runs **on your own server**:
+student data never leaves your machine.
 
-- Образ крошечный: движок llama.cpp и модели **скачиваются сами** при первом запуске.
-- Один контейнер, без внешних сервисов и API-ключей.
-- Интерфейс на русском, логин по паролю, демо-данные для знакомства.
+- Tiny image: the llama.cpp engine and the models are **downloaded automatically** on first run.
+- One container, no external services, no API keys.
+- Password login and demo data included so you can try it right away.
 
-## Быстрый старт
+## Quick start
 
 ```bash
 git clone https://git.entitybtw.ru/entitybtw/eduquery.git
 cd eduquery
-./install.sh                 # создаст .env со случайным паролем админа
+./install.sh                 # creates .env with a random admin password
 docker compose up -d
 ```
 
-Откройте `http://localhost:8080` (порт — `WEB_PORT` в `.env`), войдите логином и
-паролем, которые вывел `install.sh`.
+Open `http://localhost:8080` (port is `WEB_PORT` in `.env`) and log in with the
+credentials printed by `install.sh`.
 
-Без клонирования репозитория (готовый образ с Docker Hub):
+Without cloning the repo (prebuilt image from Docker Hub):
 
 ```bash
 docker run -d --name eduquery -p 8080:8080 -v $PWD/data:/data \
-  -e EDUQUERY_ADMIN_PASS=придумайте-пароль entbtw/eduquery:latest
+  -e EDUQUERY_ADMIN_PASS=choose-a-password entbtw/eduquery:latest
 ```
 
-## Первый запуск: что произойдёт
+## What happens on first run
 
-1. Создаётся БД `data/eduquery.db` и заполняется **демо-учениками** (если пусто).
-2. В фоне скачивается движок **llama.cpp** (`llama-server`, ~25 МБ) в `data/engine/`.
-3. В разделе **«Модели»** вы выбираете модель из каталога и жмёте «Скачать», затем «Активировать».
-4. Первый запрос к модели загружает её в память (секунды–минуты, дальше быстро).
+1. The database `data/eduquery.db` is created and filled with **demo students** (if empty).
+2. In the background, the **llama.cpp** engine (`llama-server`, ~25 MB) is downloaded to `data/engine/`.
+3. In the **Models** section you pick a model from the catalog, click "Download", then "Activate".
+4. The first request loads the model into memory (seconds to minutes); after that it is fast.
 
-Нужен доступ в интернет к `github.com` (движок) и `huggingface.co` (модели).
-Всё скачанное хранится в `./data` и переживает пересборку/обновление контейнера.
+You need internet access to `github.com` (engine) and `huggingface.co` (models).
+Everything downloaded is stored in `./data` and survives container rebuilds and updates.
 
-## Как это устроено
+## How it works
 
 ```
- браузер ──HTTP──► eduquery (Rust, axum) ──HTTP localhost──► llama-server (llama.cpp)
-                       │                                          │
-                  SQLite (data/)                           GGUF-модель (data/models/)
+ browser ──HTTP──► eduquery (Rust, axum) ──HTTP localhost──► llama-server (llama.cpp)
+                        │                                          │
+                   SQLite (data/)                           GGUF model (data/models/)
 ```
 
-- `eduquery` — единственный процесс, который вы запускаете. Он сам поднимает
-  `llama-server` как дочерний процесс на `127.0.0.1` со случайным портом и
-  перезапускает его при смене модели или размера контекста.
-- Генерация идёт потоком; если слабая модель зацикливается (повторяет одну и ту
-  же строку), ответ прерывается и помечается `loop_detected`.
-- Слишком длинный промпт не падает с ошибкой: llama-server работает в рамках
-  заданного `n_ctx`, а длинные отчёты стоит сокращать/увеличивать контекст.
+- `eduquery` is the only process you run. It starts `llama-server` as a child
+  process on `127.0.0.1` with a random port, and restarts it when the model or
+  context size changes.
+- Generation is streamed. If a weak model falls into a loop (repeating the same
+  line), the answer is cut off and flagged with `loop_detected`.
+- The context window is limited by `n_ctx`; for long reports, shorten the input
+  or raise the context size.
 
-## Возможности
+## Features
 
-| Раздел | Что делает |
+| Section | What it does |
 |---|---|
-| Обзор | Сводка по классам/группам, динамика активности |
-| Ученики | Список, карточка, контекст (оценки, посещаемость, активности) |
-| Анализ ученика | LLM-разбор по данным ученика, результат сохраняется в историю |
-| Сравнение | Сравнение нескольких учеников |
-| Вопрос по данным | Свободный вопрос к LLM по выбранным данным |
-| Импорт | Загрузка CSV (в т. ч. cp1251) |
-| Модели | Каталог, скачивание по ссылке, активация, удаление |
-| Параметры | temperature, top-p/top-k, штрафы за повтор, DRY, max tokens, контекст, системный промпт |
+| Overview | Summary per class/group, activity trends |
+| Students | List, student card, context (grades, attendance, activities) |
+| Student analysis | LLM review of one student's data; result is saved to history |
+| Comparison | Compare several students |
+| Ask about data | Free-form question to the LLM about selected data |
+| Import | Upload CSV files (including cp1251 encoding) |
+| Models | Catalog, download by URL, activate, delete |
+| Parameters | temperature, top-p/top-k, repeat penalty, DRY, max tokens, context, system prompt |
 
-### Каталог моделей
+### Model catalog
 
-| Модель | Размер | Для чего |
+| Model | Size | Use |
 |---|---|---|
-| TinyStories 260K / 15M | 1–19 МБ | только проверка, что всё работает |
-| Gemma 3 270M Instruct | ~250 МБ | минимум, русский слабый |
-| Qwen2.5 0.5B Instruct | ~490 МБ | быстрый вариант для слабого железа |
-| Llama 3.2 1B Instruct | ~810 МБ | разумный баланс |
-| Qwen2.5 1.5B Instruct | ~990 МБ | лучшее качество из каталога, нужно ≥4 ГБ RAM |
+| TinyStories 260K / 15M | 1–19 MB | smoke test only |
+| Gemma 3 270M Instruct | ~250 MB | bare minimum, weak multilingual quality |
+| Qwen2.5 0.5B Instruct | ~490 MB | fast option for weak hardware |
+| Llama 3.2 1B Instruct | ~810 MB | reasonable balance |
+| Qwen2.5 1.5B Instruct | ~990 MB | best quality in the catalog, needs ≥4 GB RAM |
 
-Любой другой **instruct-GGUF** можно скачать по прямой ссылке (раздел «Модели» →
-«Своя ссылка»). Базовые (не instruct) модели не подойдут — нужен chat-шаблон.
+Any other **instruct GGUF** can be downloaded by direct link (Models → custom URL).
+Base (non-instruct) models will not work: a chat template is required.
 
-## Настройка (переменные окружения / `.env`)
+## Configuration (environment variables / `.env`)
 
-| Переменная | По умолчанию | Описание |
+| Variable | Default | Description |
 |---|---|---|
-| `WEB_PORT` | `8080` | внешний порт панели (compose) |
-| `EDUQUERY_ADMIN_USER` | `admin` | логин администратора |
-| `EDUQUERY_ADMIN_PASS` | `admin` | пароль — **смените!** |
-| `EDUQUERY_ALLOW_ANONYMOUS` | `false` | вход без пароля (только для отладки) |
-| `EDUQUERY_N_THREADS` | `0` | потоки CPU, 0 = по числу ядер |
-| `EDUQUERY_N_CTX` | `4096` | контекст модели в токенах |
-| `EDUQUERY_ALLOW_REMOTE_DOWNLOAD` | `true` | разрешить скачивать модели и движок |
-| `EDUQUERY_ENGINE_VARIANT` | пусто | вариант llama.cpp: пусто = CPU, `vulkan` = GPU (Vulkan) |
-| `EDUQUERY_LLAMA_SERVER` | — | путь к своему `llama-server` вместо скачанного |
-| `EDUQUERY_MEMORY_LIMIT` | `8g` | лимит памяти контейнера (compose) |
-| `EDUQUERY_DATA_DIR` | `/data` | каталог данных |
-| `RUST_LOG` | `eduquery=info,warn` | уровень логов |
+| `WEB_PORT` | `8080` | external panel port (compose) |
+| `EDUQUERY_ADMIN_USER` | `admin` | admin login |
+| `EDUQUERY_ADMIN_PASS` | `admin` | admin password — **change it!** |
+| `EDUQUERY_ALLOW_ANONYMOUS` | `false` | passwordless login (debugging only) |
+| `EDUQUERY_N_THREADS` | `0` | CPU threads, 0 = number of cores |
+| `EDUQUERY_N_CTX` | `4096` | model context size in tokens |
+| `EDUQUERY_ALLOW_REMOTE_DOWNLOAD` | `true` | allow downloading models and the engine |
+| `EDUQUERY_ENGINE_VARIANT` | empty | llama.cpp build: empty = CPU, `vulkan` = GPU via Vulkan |
+| `EDUQUERY_LLAMA_SERVER` | — | path to your own `llama-server` instead of the downloaded one |
+| `EDUQUERY_MEMORY_LIMIT` | `8g` | container memory limit (compose) |
+| `EDUQUERY_DATA_DIR` | `/data` | data directory |
+| `RUST_LOG` | `eduquery=info,warn` | log level |
 
-Офлайн-режим: положите `llama-server` (со всеми `.so` из релиза llama.cpp) в
-`data/engine/`, GGUF-файлы — в `data/models/`, и поставьте
+Offline mode: put `llama-server` (with all `.so` files from a llama.cpp release)
+into `data/engine/`, GGUF files into `data/models/`, and set
 `EDUQUERY_ALLOW_REMOTE_DOWNLOAD=false`.
 
-## Данные и бэкап
+## Data and backup
 
-Всё состояние — в каталоге `./data`:
+All state lives in `./data`:
 
 ```
 data/
-├── eduquery.db     # ученики, история анализов, настройки, сессии
-├── models/         # скачанные GGUF
-└── engine/         # скачанный llama.cpp
+├── eduquery.db     # students, analysis history, settings, sessions
+├── models/         # downloaded GGUF files
+└── engine/         # downloaded llama.cpp
 ```
 
-Бэкап — копия `data/eduquery.db` (желательно при остановленном контейнере).
-Обновление: `docker compose pull && docker compose up -d`.
+Back up by copying `data/eduquery.db` (preferably while the container is stopped).
+Update: `docker compose pull && docker compose up -d`.
 
 ## API
 
-Авторизация: `POST /api/v1/login` → cookie или Bearer-токен.
+Auth: `POST /api/v1/login` → cookie or Bearer token.
 
 ```
-GET  /health                         проверка живости (без авторизации)
+GET  /health                         liveness check (no auth)
 POST /api/v1/login | /logout         GET /api/v1/me
 GET  /api/v1/overview | /groups
 GET  /api/v1/students                /{id}  /{id}/context
-POST /api/v1/seed | /import          демо-данные / импорт CSV
+POST /api/v1/seed | /import          demo data / CSV import
 GET  /api/v1/models/catalog | /models | /models/status
 POST /api/v1/models/download | /download/custom | /activate
 DELETE /api/v1/models/{id}
-POST /api/v1/generate                свободная генерация
+POST /api/v1/generate                free-form generation
 POST /api/v1/analyze/student | /compare | /overview | /ask
-GET/POST /api/v1/params              параметры генерации
+GET/POST /api/v1/params              generation parameters
 ```
 
-Пример:
+Example:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/v1/generate \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"prompt":"Кратко объясни, что такое среднее арифметическое"}'
+  -d '{"prompt":"Briefly explain what an arithmetic mean is"}'
 ```
 
-Ответ: `text`, `prompt_tokens`, `completion_tokens`, `tokens_per_sec`, `loop_detected`.
+Response: `text`, `prompt_tokens`, `completion_tokens`, `tokens_per_sec`, `loop_detected`.
 
-## Сборка из исходников
+## Building from source
 
 ```bash
-cargo build --release            # ~1 минута, C++ собирать не нужно
+cargo build --release            # ~1 minute, no C++ to compile
 EDUQUERY_DATA_DIR=./data ./target/release/eduquery
 
 docker build -t entbtw/eduquery:latest .
 ```
 
-Нужен Rust ≥ 1.80. Структура: `src/llm.rs` — управление llama-server,
-`src/server.rs` — HTTP API, `src/models.rs` — каталог и загрузка моделей,
-`src/students.rs`/`analysis.rs` — данные и промпты, `web/` — интерфейс.
+Requires Rust ≥ 1.80. Layout: `src/llm.rs` — llama-server management,
+`src/server.rs` — HTTP API, `src/models.rs` — model catalog and downloads,
+`src/students.rs` / `analysis.rs` — data and prompts, `web/` — the UI.
 
-## Решение проблем
+## Troubleshooting
 
-- **«не выбрана активная модель»** — скачайте и активируйте модель в разделе «Модели».
-- **Движок не скачался** — проверьте доступ к github.com; смотрите `docker logs eduquery`.
-- **llama-server завершился при запуске** — файл модели повреждён/не GGUF, либо не хватает RAM.
-- **Модель отвечает мусором или повторяется** — возьмите модель крупнее (1.5B), поднимите
-  `repeat_penalty`/DRY в «Параметрах», увеличьте контекст.
-- **Контейнер убивается по памяти** — увеличьте `EDUQUERY_MEMORY_LIMIT` или возьмите модель меньше.
+- **"no active model selected"** — download and activate a model in the Models section.
+- **Engine did not download** — check access to github.com; see `docker logs eduquery`.
+- **llama-server exited on startup** — the model file is corrupt / not a GGUF, or there is not enough RAM.
+- **Model outputs garbage or repeats itself** — use a larger model (1.5B), raise
+  `repeat_penalty`/DRY in Parameters, increase the context.
+- **Container killed for memory** — raise `EDUQUERY_MEMORY_LIMIT` or use a smaller model.
 
-## Лицензия
+## License
 
 MIT
