@@ -52,3 +52,11 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+# MTU сети контейнера. Если у хоста MTU меньше 1500 (VPN, PPPoE, туннели),
+# скачивание из контейнера почти стоит — тогда поставьте тот же MTU, что у хоста
+# (смотрите `ip link`): EDUQUERY_MTU=1376 в .env.
+networks:
+  default:
+    driver_opts:
+      com.docker.network.driver.mtu: "${EDUQUERY_MTU:-1500}"

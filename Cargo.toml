@@ -1,6 +1,6 @@
 [package]
 name = "eduquery"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 rust-version = "1.80"
 description = "Локальная LLM-платформа для анализа учебной деятельности учеников"
@@ -10,7 +10,7 @@ license = "MIT"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "cors", "set-header"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

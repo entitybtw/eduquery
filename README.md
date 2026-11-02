@@ -130,6 +130,7 @@ Accounts live in the SQLite database. `EDUQUERY_ADMIN_USER` / `EDUQUERY_ADMIN_PA
 | `EDUQUERY_N_CTX` | `4096` | model context size in tokens |
 | `EDUQUERY_ALLOW_REMOTE_DOWNLOAD` | `true` | allow installing the engine and downloading models |
 | `EDUQUERY_ENGINE_VARIANT` | empty | llama.cpp build: empty = CPU, `vulkan` = GPU via Vulkan |
+| `EDUQUERY_ENGINE_URL` | — | direct `.tar.gz` link to a llama.cpp release (mirror), skips the GitHub API |
 | `EDUQUERY_LLAMA_SERVER` | — | path to your own `llama-server` instead of the downloaded one |
 | `EDUQUERY_MEMORY_LIMIT` | `8g` | container memory limit (compose) |
 | `EDUQUERY_DATA_DIR` | `/data` | data directory |
@@ -204,10 +205,12 @@ Requires Rust ≥ 1.80. Layout: `src/llm.rs` — llama-server management,
 - **"engine is not installed"** — click *Install* in the First-run window or on the Models tab.
 - **"no active model selected"** — download and activate a model in the Models section.
 - **Forgot the admin password** — stop the container, delete the `users` rows (`sqlite3 data/eduquery.db "DELETE FROM users"`) and start again: the admin from `EDUQUERY_ADMIN_*` is recreated.
-- **Engine did not download** — check access to github.com (the error is shown in the UI; downloads resume after drops); see `docker logs eduquery`.
+- **Engine did not download** — check access to github.com (the error is shown in the UI; downloads resume after drops, and if the GitHub API is unreachable a pinned llama.cpp version is fetched directly). Behind a slow/blocked network set `EDUQUERY_ENGINE_URL` to a mirror; see `docker logs eduquery`.
 - **llama-server exited on startup** — the model file is corrupt / not a GGUF, or there is not enough RAM.
 - **Model outputs garbage or repeats itself** — use a larger model (1.5B), raise
   `repeat_penalty`/DRY in Parameters, increase the context.
+- **HTTP 504 behind a reverse proxy** — AI requests can take minutes (model load + generation). eduquery sends a keep-alive space every 10 s while the model works, so default proxy timeouts are not hit; if you still get 504, raise `proxy_read_timeout` (nginx) to a few minutes. Note such requests always answer `200`; a generation error arrives as `{"error": "..."}` in the body.
+- **Slow downloads inside Docker (works on the host)** — MTU mismatch: set `EDUQUERY_MTU` in `.env` to your host MTU (`ip link`).
 - **Container killed for memory** — raise `EDUQUERY_MEMORY_LIMIT` or use a smaller model.
 
 ## License

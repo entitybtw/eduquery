@@ -107,6 +107,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .fallback_service(ServeDir::new(web).append_index_html_on_directories(true))
         .fallback_service(ServeDir::new("web"))
         .layer(TraceLayer::new_for_http())
+        // Браузер всегда перепроверяет файлы: после обновления сразу видна новая версия.
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ))
         .with_state(state);
     router
 }
@@ -220,6 +225,39 @@ async fn auth_middleware(
     req.extensions_mut().insert(Token(token));
     req.extensions_mut().insert(user);
     next.run(req).await
+}
+
+/// Долгие запросы к ИИ: пока модель думает, шлём пробелы-«пульс» каждые 10 секунд,
+/// чтобы обратный прокси (nginx и др.) не обрывал соединение по таймауту (504).
+/// JSON допускает ведущие пробелы, поэтому клиент получает обычный ответ.
+/// Статус при этом всегда 200 — ошибка генерации приходит как `{"error": ...}`.
+fn keepalive<F>(fut: F) -> Response
+where
+    F: std::future::Future<Output = Response> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(8);
+    tokio::spawn(async move {
+        tokio::pin!(fut);
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        tick.tick().await;
+        let resp = loop {
+            tokio::select! {
+                r = &mut fut => break r,
+                _ = tick.tick() => { let _ = tx.send(axum::body::Bytes::from_static(b" ")).await; }
+            }
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap_or_default();
+        let _ = tx.send(body).await;
+    });
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|b| (Ok::<_, std::convert::Infallible>(b), rx))
+    });
+    let mut resp = Response::new(axum::body::Body::from_stream(stream));
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    h.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    resp
 }
 
 // ──────────────────────────────── Handlers ────────────────────────────────
@@ -781,16 +819,15 @@ async fn generate(
 
     let engine = state.engine.clone();
     let model = path.clone();
-    let result: Result<anyhow::Result<crate::llm::GenOutput>, String> = Ok(engine.generate(&model, &msgs, &params).await);
-
-    match result {
-        Ok(Ok(out)) => Json(out).into_response(),
-        Ok(Err(e)) => {
-            tracing::error!("generate: {e:#}");
-            json_err(&format!("ошибка генерации: {e:#}"), StatusCode::INTERNAL_SERVER_ERROR)
+    keepalive(async move {
+        match engine.generate(&model, &msgs, &params).await {
+            Ok(out) => Json(out).into_response(),
+            Err(e) => {
+                tracing::error!("generate: {e:#}");
+                json_err(&format!("ошибка генерации: {e:#}"), StatusCode::INTERNAL_SERVER_ERROR)
+            }
         }
-        Err(e) => json_err(&format!("задача упала: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
-    }
+    })
 }
 
 // ── анализ ──
@@ -984,29 +1021,28 @@ async fn run_analysis(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let result: Result<anyhow::Result<crate::llm::GenOutput>, String> = Ok(engine.generate(&model, &msgs, &params).await);
-
-    match result {
-        Ok(Ok(out)) => {
-            if let Some(sid) = student_id {
-                let prompt_text = gen
-                    .messages
-                    .first()
-                    .map(|m| m.content.clone())
-                    .unwrap_or_default();
-                let _ = state.db.conn().execute(
-                    "INSERT INTO analyses(student_id, model_id, prompt, answer) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![sid, model_id, prompt_text, out.text],
-                );
+    keepalive(async move {
+        match engine.generate(&model, &msgs, &params).await {
+            Ok(out) => {
+                if let Some(sid) = student_id {
+                    let prompt_text = gen
+                        .messages
+                        .first()
+                        .map(|m| m.content.clone())
+                        .unwrap_or_default();
+                    let _ = state.db.conn().execute(
+                        "INSERT INTO analyses(student_id, model_id, prompt, answer) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![sid, model_id, prompt_text, out.text],
+                    );
+                }
+                Json(out).into_response()
             }
-            Json(out).into_response()
+            Err(e) => {
+                tracing::error!("analysis: {e:#}");
+                json_err(&format!("ошибка генерации: {e:#}"), StatusCode::INTERNAL_SERVER_ERROR)
+            }
         }
-        Ok(Err(e)) => {
-            tracing::error!("analysis: {e:#}");
-            json_err(&format!("ошибка генерации: {e:#}"), StatusCode::INTERNAL_SERVER_ERROR)
-        }
-        Err(e) => json_err(&format!("задача упала: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
-    }
+    })
 }
 
 // ──────────────────────────────── Прочее ────────────────────────────────

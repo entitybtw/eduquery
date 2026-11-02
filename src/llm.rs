@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
+/// Версия llama.cpp, которая берётся, если GitHub API недоступен.
+const PINNED_TAG: &str = "b12034";
+
 /// Параметры генерации, настраиваемые пользователем в UI.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GenParams {
@@ -212,16 +215,29 @@ impl Engine {
             format!("bin-ubuntu-{variant}-{arch}.tar.gz")
         };
 
-        let mut last_err = anyhow!("нет ответа от GitHub");
-        for attempt in 0..5 {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+        // Своя ссылка (зеркало) имеет приоритет.
+        if let Ok(u) = std::env::var("EDUQUERY_ENGINE_URL") {
+            if !u.trim().is_empty() {
+                let name = u.rsplit('/').next().unwrap_or("llama.cpp").to_string();
+                return Ok((u.trim().to_string(), name));
             }
+        }
+
+        // Сначала берём только самый свежий релиз (маленький ответ), если в нём
+        // нет нужной сборки — запрашиваем больше.
+        let mut last_err = anyhow!("нет ответа от GitHub");
+        for (attempt, per_page) in [1, 1, 1, 10, 10].into_iter().enumerate() {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+            }
+            self.set_stage(&format!("Поиск релиза llama.cpp (попытка {})", attempt + 1));
             let res: Result<serde_json::Value> = async {
                 Ok(self
                     .http
-                    .get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10")
-                    .timeout(Duration::from_secs(30))
+                    .get(format!(
+                        "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page={per_page}"
+                    ))
+                    .timeout(Duration::from_secs(60))
                     .send()
                     .await?
                     .error_for_status()?
@@ -242,16 +258,26 @@ impl Engine {
                                 .map(|n| n.starts_with("llama-") && n.ends_with(&suffix))
                                 .unwrap_or(false)
                         });
-                    return match found {
-                        Some(a) => Ok((
+                    if let Some(a) = found {
+                        return Ok((
                             a["browser_download_url"].as_str().unwrap_or_default().to_string(),
                             a["name"].as_str().unwrap_or_default().to_string(),
-                        )),
-                        None => Err(anyhow!("в релизах llama.cpp нет сборки «{suffix}»")),
-                    };
+                        ));
+                    }
+                    last_err = anyhow!("в релизах llama.cpp нет сборки «{suffix}»");
                 }
                 Err(e) => last_err = e.context("не удалось получить список релизов llama.cpp"),
             }
+        }
+
+        // Запасной вариант: известная рабочая версия по прямой ссылке (без API).
+        if variant.is_empty() {
+            let name = format!("llama-{PINNED_TAG}-{suffix}");
+            tracing::warn!("GitHub API недоступен ({last_err:#}), беру фиксированную версию {PINNED_TAG}");
+            let url = format!(
+                "https://github.com/ggml-org/llama.cpp/releases/download/{PINNED_TAG}/{name}"
+            );
+            return Ok((url, name));
         }
         Err(last_err)
     }

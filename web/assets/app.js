@@ -47,6 +47,8 @@ async function api(path, opts = {}) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
   if (!r.ok) throw new Error((data && data.error) || `HTTP ${r.status}`);
+  // Долгие запросы к ИИ отвечают 200 + пробелы-«пульс», ошибка приходит в теле.
+  if (data && typeof data === 'object' && data.error && Object.keys(data).length === 1) throw new Error(data.error);
   return data;
 }
 
