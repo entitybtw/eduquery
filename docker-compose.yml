@@ -1,0 +1,52 @@
+# eduquery — локальная LLM-платформа для анализа учебной деятельности учеников.
+#
+#   cd /home/entitybtw/eduquery
+#   cp .env.example .env      # или сгенерируй install.sh (рандомный пароль)
+#   docker compose up -d --build
+#
+# Панель:   http://HOST:${WEB_PORT}
+# Логин:    ${EDUQUERY_ADMIN_USER} / ${EDUQUERY_ADMIN_PASS}
+#
+# Как это работает:
+#  - Внутри одного контейнера: Rust-сервер (axum) + SQLite + встроенный
+#    llama.cpp (инференс GGUF-моделей). Никаких внешних сервисов.
+#  - Модели скачиваются из интернета в /data/models и кэшируются на диске.
+#  - Данные (БД + модели) живут на ХОСТЕ в ./data, поэтому панель не теряет
+#    историю анализов при пересборке образа.
+
+services:
+  eduquery:
+    build: .
+    image: eduquery:latest
+    container_name: eduquery
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    environment:
+      EDUQUERY_HOST: 0.0.0.0
+      EDUQUERY_PORT: "8080"
+      EDUQUERY_DATA_DIR: /data
+      EDUQUERY_ADMIN_USER: ${EDUQUERY_ADMIN_USER:-admin}
+      EDUQUERY_ADMIN_PASS: ${EDUQUERY_ADMIN_PASS:-admin}
+      # 0 = автоопределение по числу ядер CPU.
+      EDUQUERY_N_THREADS: ${EDUQUERY_N_THREADS:-0}
+      # Размер контекста модели в токенах.
+      EDUQUERY_N_CTX: ${EDUQUERY_N_CTX:-4096}
+      # Разрешить скачивание GGUF-моделей из внешней сети.
+      EDUQUERY_ALLOW_REMOTE_DOWNLOAD: ${EDUQUERY_ALLOW_REMOTE_DOWNLOAD:-true}
+      # Вход без пароля (только для локальной отладки).
+      EDUQUERY_ALLOW_ANONYMOUS: ${EDUQUERY_ALLOW_ANONYMOUS:-false}
+      RUST_LOG: ${RUST_LOG:-eduquery=info,warn}
+    volumes:
+      - ./data:/data
+    # Модели требуют памяти — снимаем лимит, если хост ограничен.
+    deploy:
+      resources:
+        limits:
+          memory: ${EDUQUERY_MEMORY_LIMIT:-8g}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

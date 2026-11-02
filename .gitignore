@@ -1,0 +1,22 @@
+# Сборка и запуск
+target/
+**/target/
+*.rs.bk
+
+# Данные приложения (БД, скачанные модели)
+data/
+models/
+*.gguf
+*.gguf.part
+*.db
+*.db-wal
+*.db-shm
+
+# Окружение
+.env
+
+# Редакторы и ОС
+.idea/
+.vscode/
+.DS_Store
+*.swp

@@ -1,0 +1,32 @@
+# Всё, что не нужно для сборки образа
+.git
+.gitignore
+.github
+
+# Данные и модели — они монтируются в контейнер
+data
+models
+*.gguf
+*.gguf.part
+*.db
+*.db-wal
+*.db-shm
+
+# Локальное окружение
+.env
+.env.example
+
+# Документация и скрипты (в образе не нужны, но install.sh полезен)
+README.md
+install.sh
+scripts
+
+# IDE
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Rust
+target
+**/target

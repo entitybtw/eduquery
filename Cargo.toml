@@ -1,0 +1,41 @@
+[package]
+name = "eduquery"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Локальная LLM-платформа для анализа учебной деятельности учеников"
+license = "MIT"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros", "multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup", "serde_json"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "stream",
+    "rustls-tls",
+    "json",
+] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+walkdir = "2"
+mime_guess = "2"
+llama-cpp-2 = { version = "0.1.160", default-features = false, features = ["sampler", "openmp"] }
+encoding_rs = "0.8"
+csv = "1"
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
