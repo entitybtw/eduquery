@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>eduquery</title>
-<meta name="app-version" content="0.0.5">
+<meta name="app-version" content="0.0.6">
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/assets/style.css">
 </head>
@@ -405,12 +405,14 @@
         <div class="panel">
           <h3>Системный промпт</h3>
           <div class="fg"><label>Текст системного промпта</label><textarea id="pSystem" rows="22"></textarea></div>
+          <button class="b b-p" onclick="saveParams()">Сохранить</button>
           <button class="b" onclick="resetSystemPrompt()">Вернуть стандартный</button>
-          <div class="hint">Инструкция, которая отправляется модели с каждым запросом: какие данные она получает, как их трактовать и в каком формате отвечать. Системный промпт остаётся отдельным от примера. После правки нажмите «Сохранить» слева.</div>
+          <div class="hint">Инструкция, которая отправляется модели с каждым запросом: какие данные она получает, как их трактовать и в каком формате отвечать. Системный промпт остаётся отдельным от примера. Сохраняются все параметры страницы сразу.</div>
 
           <h3 style="margin-top:18px">Пример запроса и ответа (few-shot)</h3>
           <div class="fg"><label>Пример запроса</label><textarea id="pExampleIn" rows="5" placeholder="Вставьте пример входных данных или вопроса"></textarea></div>
           <div class="fg"><label>Пример ответа</label><textarea id="pExampleOut" rows="12" placeholder="Ответ, стиль и структуру которого должна повторить модель"></textarea></div>
+          <button class="b b-p" onclick="saveParams()">Сохранить</button>
           <button class="b" onclick="clearExample()">Очистить пример</button>
           <div class="hint">Пример отправляется перед реальным запросом парой «запрос — ответ»: модель видит, как нужно оформлять результат. Системный промпт при этом не меняется. Пустые поля отключают пример.</div>
           <div class="panel" style="margin-top:14px">
@@ -463,6 +465,26 @@
     <div class="fg"><label>Новый пароль</label><input id="mpNew" type="password" autocomplete="new-password"></div>
     <button class="b b-p" onclick="savePass()">Сменить</button>
     <div id="mpMsg" class="output"></div>
+  </div>
+</div>
+
+<div id="mPartials" class="mbg">
+  <div class="md md-wide" onclick="event.stopPropagation()">
+    <div class="md-h"><h2>Недокачанные модели</h2><button class="b" onclick="closePartials()">Позже</button></div>
+    <p class="muted">После перезапуска остались недокачанные файлы. Загрузку можно продолжить с места обрыва или удалить остатки и начать заново.</p>
+    <div id="partialsBody" class="list" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<div id="mStopDownload" class="mbg">
+  <div class="md" onclick="event.stopPropagation()">
+    <div class="md-h"><h2>Остановить загрузку?</h2><button class="b" onclick="closeStopDownload()">Продолжить загрузку</button></div>
+    <p class="muted">Модель <b id="stopDlName"></b>. Остановка не удаляет уже скачанное: недокачанный файл можно сохранить и продолжить позже либо удалить.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px">
+      <button class="b b-p" id="stopDlSaved" onclick="confirmStopDownload(false)">Остановить, сохранить остатки</button>
+      <button class="b b-r" id="stopDlDelete" onclick="confirmStopDownload(true)">Остановить и удалить остатки</button>
+    </div>
+    <div id="stopDlMsg" class="output"></div>
   </div>
 </div>
 

@@ -4,10 +4,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Предопределённая модель из каталога.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +158,20 @@ pub struct ModelStore {
     dir: PathBuf,
     /// Активные загрузки (id -> прогресс), чтобы не качать дважды.
     downloads: Arc<Mutex<Vec<DownloadState>>>,
+    /// Токены отмены активных загрузок.
+    cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
+}
+
+/// Снимает токен отмены при любом завершении загрузки — успехе, ошибке или остановке.
+struct CancelGuard {
+    cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    id: String,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.cancels.lock().unwrap().remove(&self.id);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,6 +193,7 @@ impl ModelStore {
         Self {
             dir,
             downloads: Arc::new(Mutex::new(Vec::new())),
+            cancels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -254,6 +271,9 @@ impl ModelStore {
 
     /// Удалить файл модели.
     pub fn delete(&self, id: &str) -> Result<()> {
+        if self.is_running(id) {
+            bail!("сначала остановите загрузку модели");
+        }
         let p = self.path_for(id);
         if p.exists() {
             std::fs::remove_file(&p).with_context(|| format!("не удалось удалить {}", p.display()))?;
@@ -267,6 +287,38 @@ impl ModelStore {
         Ok(())
     }
 
+    /// Удалить только недокачанный файл, не трогая готовую модель.
+    pub fn delete_partial(&self, id: &str) -> Result<bool> {
+        if self.is_running(id) {
+            bail!("сначала остановите загрузку модели");
+        }
+        let part = self.dir.join(format!("{id}.gguf.part"));
+        let existed = part.exists();
+        if existed {
+            std::fs::remove_file(&part)
+                .with_context(|| format!("не удалось удалить {}", part.display()))?;
+        }
+        self.downloads.lock().unwrap().retain(|d| d.id != id);
+        Ok(existed)
+    }
+
+    /// Остановить активную загрузку. Файл `.gguf.part` остаётся на диске.
+    pub fn cancel(&self, id: &str) -> bool {
+        let token = self.cancels.lock().unwrap().get(id).cloned();
+        match token {
+            Some(t) => {
+                t.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Идёт ли сейчас загрузка этого id.
+    pub fn is_running(&self, id: &str) -> bool {
+        self.cancels.lock().unwrap().contains_key(id)
+    }
+
     pub fn downloads(&self) -> Vec<DownloadState> {
         self.downloads.lock().unwrap().clone()
     }
@@ -276,6 +328,18 @@ impl ModelStore {
         if let Some(d) = list.iter_mut().find(|d| d.id == id) {
             f(d);
         }
+    }
+
+    fn mark_cancelled(&self, id: &str) {
+        self.update_download(id, |d| {
+            d.status = "cancelled".into();
+            d.error = None;
+        });
+    }
+
+    fn cancelled_error(&self, id: &str) -> anyhow::Error {
+        self.mark_cancelled(id);
+        anyhow!("загрузка остановлена")
     }
 
     /// Скачать модель в файл `<id>.gguf`.
@@ -303,11 +367,12 @@ impl ModelStore {
         }
 
         let tmp = target.with_extension("gguf.part");
+        if self.is_running(id) {
+            bail!("модель уже скачивается");
+        }
+        let token = CancellationToken::new();
         {
             let mut list = self.downloads.lock().unwrap();
-            if list.iter().any(|d| d.id == id && d.status == "running") {
-                bail!("модель уже скачивается");
-            }
             list.retain(|d| d.id != id);
             let partial = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
             list.push(DownloadState {
@@ -320,7 +385,15 @@ impl ModelStore {
                 file: None,
                 url: urls.first().cloned(),
             });
+            self.cancels
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), token.clone());
         }
+        let _guard = CancelGuard {
+            cancels: self.cancels.clone(),
+            id: id.to_string(),
+        };
 
         let client = reqwest::Client::builder()
             .user_agent(concat!("eduquery/", env!("CARGO_PKG_VERSION")))
@@ -332,13 +405,19 @@ impl ModelStore {
         let mut last_err: Option<anyhow::Error> = None;
         // Несколько кругов по зеркалам: сеть может моргнуть на любом из них.
         for round in 0..3u32 {
+            if token.is_cancelled() {
+                return Err(self.cancelled_error(id));
+            }
             for url in urls {
+                if token.is_cancelled() {
+                    return Err(self.cancelled_error(id));
+                }
                 self.update_download(id, |d| {
                     d.status = "running".into();
                     d.error = None;
                     d.url = Some(url.clone());
                 });
-                match self.download_one(&client, url, &tmp, id).await {
+                match self.download_one(&client, url, &tmp, id, &token).await {
                     Ok(()) => {
                         // Проверяем GGUF-магию — иначе на диск попадёт HTML-страница.
                         let mut magic = [0u8; 4];
@@ -387,6 +466,9 @@ impl ModelStore {
                         return Ok(target);
                     }
                     Err(e) => {
+                        if token.is_cancelled() {
+                            return Err(self.cancelled_error(id));
+                        }
                         tracing::warn!("не удалось скачать {id} с {url}: {e:#}");
                         let msg = format!("{e:#}");
                         last_err = Some(e);
@@ -400,7 +482,10 @@ impl ModelStore {
                     d.status = "running".into();
                     d.error = Some("обрыв связи, повторяю попытку…".into());
                 });
-                tokio::time::sleep(pause).await;
+                tokio::select! {
+                    _ = token.cancelled() => return Err(self.cancelled_error(id)),
+                    _ = tokio::time::sleep(pause) => {}
+                }
             }
         }
 
@@ -421,18 +506,22 @@ impl ModelStore {
         url: &str,
         dest: &Path,
         id: &str,
+        cancel: &CancellationToken,
     ) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
+        if cancel.is_cancelled() {
+            bail!("загрузка остановлена");
+        }
         let have = tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0);
         let mut req = client.get(url);
         if have > 0 {
             req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
         }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("не удалось подключиться к {url}"))?;
+        let resp = tokio::select! {
+            _ = cancel.cancelled() => bail!("загрузка остановлена"),
+            r = req.send() => r.with_context(|| format!("не удалось подключиться к {url}"))?,
+        };
         let status = resp.status();
         if status.as_u16() == 416 {
             return Ok(()); // файл уже скачан целиком
@@ -466,9 +555,12 @@ impl ModelStore {
 
         let mut stream = resp.bytes_stream();
         loop {
-            let next = tokio::time::timeout(Duration::from_secs(60), stream.next())
-                .await
-                .map_err(|_| anyhow!("таймаут: нет данных 60 секунд"))?;
+            let next = tokio::select! {
+                _ = cancel.cancelled() => bail!("загрузка остановлена"),
+                next = tokio::time::timeout(Duration::from_secs(60), stream.next()) => {
+                    next.map_err(|_| anyhow!("таймаут: нет данных 60 секунд"))?
+                }
+            };
             let Some(chunk) = next else { break };
             let chunk = chunk?;
             file.write_all(&chunk).await.context("ошибка записи файла модели")?;

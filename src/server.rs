@@ -90,8 +90,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/models", get(list_models))
         .route("/api/v1/models/download", post(download_model))
         .route("/api/v1/models/download/custom", post(download_custom))
+        .route("/api/v1/models/download/cancel", post(cancel_download))
         .route("/api/v1/models/activate", post(activate_model))
         .route("/api/v1/models/{id}", delete(delete_model))
+        .route("/api/v1/models/{id}/partial", delete(delete_partial))
         .route("/api/v1/models/status", get(models_status))
         // ── генерация ──
         .route("/api/v1/generate", post(generate))
@@ -633,18 +635,30 @@ async fn download_model(
     if !state.allow_remote_download {
         return json_err("загрузка из сети отключена", StatusCode::FORBIDDEN);
     }
-    let Some(entry) = models::catalog_entry(&req.id) else {
-        return json_err("модель не найдена в каталоге", StatusCode::NOT_FOUND);
+    let id = sanitize_id(&req.id);
+    if id.is_empty() {
+        return json_err("некорректный id", StatusCode::BAD_REQUEST);
+    }
+    // Своя модель могла быть остановлена: ссылка сохранена при первом запуске,
+    // поэтому после рестарта её тоже можно продолжить.
+    let (name, urls, expected_size) = if let Some(entry) = models::catalog_entry(&id) {
+        (
+            entry.name.to_string(),
+            models::candidate_urls(entry),
+            Some(entry.size_approx),
+        )
+    } else {
+        let Some(url) = state.db.get_setting(&format!("download_url:{id}")) else {
+            return json_err("модель не найдена в каталоге", StatusCode::NOT_FOUND);
+        };
+        let name = state
+            .db
+            .get_setting(&format!("download_name:{id}"))
+            .unwrap_or_else(|| id.clone());
+        (name, vec![url], None)
     };
-    let urls = models::candidate_urls(entry);
-    spawn_download(
-        state.clone(),
-        entry.id.to_string(),
-        entry.name.to_string(),
-        urls,
-        Some(entry.size_approx),
-    );
-    Json(json!({"status": "started", "id": entry.id})).into_response()
+    spawn_download(state.clone(), id.clone(), name, urls, expected_size);
+    Json(json!({"status": "started", "id": id})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -668,8 +682,51 @@ async fn download_custom(
     if id.is_empty() {
         return json_err("некорректный id", StatusCode::BAD_REQUEST);
     }
+    // Сохраняем ссылку и имя: после перезапуска недокачанную модель можно
+    // продолжить, даже если это была своя ссылка, а не запись каталога.
+    let _ = state
+        .db
+        .set_setting(&format!("download_url:{id}"), &req.url);
+    let _ = state
+        .db
+        .set_setting(&format!("download_name:{id}"), &req.name);
     spawn_download(state.clone(), id, req.name, vec![req.url], None);
     Json(json!({"status": "started"})).into_response()
+}
+
+/// Остановить активную загрузку, сохранив `.gguf.part` для продолжения.
+async fn cancel_download(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DownloadReq>,
+) -> Response {
+    let id = sanitize_id(&req.id);
+    if !state.store.cancel(&id) {
+        return json_err("загрузка уже не выполняется", StatusCode::CONFLICT);
+    }
+    // Ждём, пока задача действительно отпустит файл: после этого можно
+    // безопасно удалить остатки или показать «Продолжить».
+    for _ in 0..50 {
+        if !state.store.is_running(&id) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if state.store.is_running(&id) {
+        return json_err("загрузка не остановилась за 5 секунд", StatusCode::CONFLICT);
+    }
+    Json(json!({"status": "ok", "id": id})).into_response()
+}
+
+/// Удалить только недокачанный файл. Готовую модель этот маршрут не трогает.
+async fn delete_partial(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let id = sanitize_id(&id);
+    match state.store.delete_partial(&id) {
+        Ok(existed) => Json(json!({"status": "ok", "existed": existed})).into_response(),
+        Err(e) => json_err(&format!("ошибка удаления остатков: {e}"), StatusCode::CONFLICT),
+    }
 }
 
 pub(crate) fn sanitize_id(s: &str) -> String {
@@ -712,13 +769,27 @@ fn spawn_download(
                     tracing::info!("активная модель: {id}");
                 }
             }
-            Err(e) => tracing::error!("ошибка скачивания модели {id}: {e}"),
+            Err(e) => {
+                let cancelled = state
+                    .store
+                    .downloads()
+                    .iter()
+                    .any(|d| d.id == id && d.status == "cancelled");
+                if cancelled {
+                    tracing::info!("загрузка модели {id} остановлена, остатки сохранены");
+                } else {
+                    tracing::error!("ошибка скачивания модели {id}: {e}");
+                }
+            }
         }
     });
 }
 
 async fn delete_model(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let id = sanitize_id(&id);
+    if state.store.is_running(&id) {
+        return json_err("сначала остановите загрузку модели", StatusCode::CONFLICT);
+    }
     state.engine.evict(&state.store.path_for(&id));
     if let Err(e) = state.store.delete(&id) {
         return json_err(&format!("ошибка удаления: {e}"), StatusCode::INTERNAL_SERVER_ERROR);

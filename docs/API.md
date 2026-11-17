@@ -95,8 +95,10 @@ GET  /api/v1/models
 GET  /api/v1/models/status
 POST /api/v1/models/download          {"id":"qwen2.5-0.5b"}
 POST /api/v1/models/download/custom   {"id":"my-model","name":"Моя модель","url":"https://…/model.gguf"}
+POST /api/v1/models/download/cancel   {"id":"qwen2.5-0.5b"}
 POST /api/v1/models/activate          {"id":"qwen2.5-0.5b"}
 DELETE /api/v1/models/{id}
+DELETE /api/v1/models/{id}/partial
 GET  /api/v1/engine/status
 POST /api/v1/engine/install
 ```
@@ -104,8 +106,17 @@ POST /api/v1/engine/install
 `GET /api/v1/models` возвращает `models`, `files` (`[[id, size], …]`), `partials`
 (`[[id, size], …]`), `active` (путь), `loaded`, `downloads`.
 
-Загрузка идёт в фоне. `status`: `running` / `done` / `error`. Прогресс:
+Загрузка идёт в фоне. `status`: `running` / `done` / `error` / `cancelled`. Прогресс:
 `{"id","name","received","total","status","error","file","url"}`.
+
+`POST /api/v1/models/download/cancel` останавливает загрузку, сохраняя `.gguf.part`.
+Обработчик ждёт до 5 секунд, пока задача действительно завершится, и отвечает `409`,
+если загрузка уже не выполняется. `DELETE /api/v1/models/{id}/partial` удаляет только
+недокачанный файл; готовая модель не затрагивается. `DELETE /api/v1/models/{id}` во время
+активной загрузки возвращает `409`.
+
+Своя ссылка (`download/custom`) сохраняется в настройках как `download_url:<id>` и
+`download_name:<id>`, поэтому после перезапуска такую загрузку тоже можно продолжить.
 
 ## Генерация и анализ
 

@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "eduquery"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "argon2",
@@ -345,6 +345,7 @@ dependencies = [
  "tar",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -1645,6 +1646,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

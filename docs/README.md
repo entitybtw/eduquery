@@ -40,4 +40,4 @@ Rust, SQLite и `llama-server` на том же сервере: данные н�
 
 ## Статус
 
-Текущая версия — **0.0.5**. Изменения — в [`CHANGELOG.md`](CHANGELOG.md).
+Текущая версия — **0.0.6**. Изменения — в [`CHANGELOG.md`](CHANGELOG.md).

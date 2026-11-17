@@ -8,13 +8,18 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
 const state = {
   students: [],
   models: [],
+  files: [],
   catalog: [],
+  partials: [],
+  downloads: [],
   activeModel: '',
   currentStudent: null,
   me: null,
   engine: null,
   allPerms: [],
   editUserId: null,
+  stopDownloadId: null,
+  partialsPrompted: false,
   setupDismissed: false,
   prevEngineRunning: false,
   prevDl: {},
@@ -261,6 +266,8 @@ async function boot() {
   if (state.engine && !state.engine.installed && !state.setupDismissed) {
     if (can('models')) openSetup();
     else toast('Движок ИИ не установлен — обратитесь к администратору', 'err');
+  } else {
+    maybeOfferPartials();
   }
 }
 
@@ -702,12 +709,18 @@ async function loadModels() {
     state.activeModel = r.active || '';
     const files = (r.files || []).map(pairOf);
     const partials = (r.partials || []).map(pairOf);
+    const dl = r.downloads || [];
+    state.files = files;
+    state.partials = partials;
+    state.downloads = dl;
     const active = activeId();
     const manage = can('models');
+    const runningOf = (id) => dl.find((d) => d.id === id && d.status === 'running');
 
     $('catalogList').innerHTML = state.catalog.length ? state.catalog.map((c) => {
       const file = files.find((f) => f.id === c.id);
       const part = partials.find((p) => p.id === c.id);
+      const running = runningOf(c.id);
       const isActive = active === c.id;
       const partPct = part && c.size_approx ? Math.min(99, Math.round((part.size / c.size_approx) * 100)) : 0;
       return `<div class="list-row">
@@ -722,13 +735,16 @@ async function loadModels() {
         <div style="text-align:right;white-space:nowrap">
           ${!manage
             ? (isActive ? '<span class="tag tag-ok">активна</span>' : '')
-            : file
-              ? `<button class="b b-sm b-g" onclick="activateModel('${esc(c.id)}')">${isActive ? 'Активна' : 'Сделать активной'}</button>
-                 <button class="b b-sm b-r" onclick="deleteModel('${esc(c.id)}')">Удалить</button>`
-              : part
-                ? `<button class="b b-sm b-p" onclick="downloadModel('${esc(c.id)}')">Продолжить (${fmtBytes(part.size)})</button>
+            : running
+              ? `<span class="tag tag-w">скачивается</span>
+                 <button class="b b-sm b-r" onclick="openStopDownload('${esc(c.id)}')">Остановить</button>`
+              : file
+                ? `<button class="b b-sm b-g" onclick="activateModel('${esc(c.id)}')">${isActive ? 'Активна' : 'Сделать активной'}</button>
                    <button class="b b-sm b-r" onclick="deleteModel('${esc(c.id)}')">Удалить</button>`
-                : `<button class="b b-sm b-p" onclick="downloadModel('${esc(c.id)}')">Скачать</button>`}
+                : part
+                  ? `<button class="b b-sm b-p" onclick="downloadModel('${esc(c.id)}')">Продолжить (${fmtBytes(part.size)})</button>
+                     <button class="b b-sm b-r" onclick="deletePartial('${esc(c.id)}')">Удалить остатки</button>`
+                  : `<button class="b b-sm b-p" onclick="downloadModel('${esc(c.id)}')">Скачать</button>`}
         </div>
       </div>`;
     }).join('') : '<div class="empty">Каталог недоступен. Нажмите «Обновить» или проверьте подключение к сети.</div>';
@@ -747,21 +763,30 @@ async function loadModels() {
         <div class="grow"><b>${esc(modelName(id))}</b>
         <div class="muted mono">${esc(id)} · недокачано ${fmtBytes(size)}</div></div>
         <div style="white-space:nowrap">
-          ${manage ? `<button class="b b-sm b-p" onclick="downloadModel('${esc(id)}')">Продолжить</button>
-          <button class="b b-sm b-r" onclick="deleteModel('${esc(id)}')">Удалить</button>` : ''}
+          ${manage
+            ? (runningOf(id)
+              ? `<span class="tag tag-w">скачивается</span>
+                 <button class="b b-sm b-r" onclick="openStopDownload('${esc(id)}')">Остановить</button>`
+              : `<button class="b b-sm b-p" onclick="downloadModel('${esc(id)}')">Продолжить</button>
+                 <button class="b b-sm b-r" onclick="deletePartial('${esc(id)}')">Удалить остатки</button>`)
+            : ''}
         </div>
       </div>`);
     $('modelList').innerHTML = installedRows.concat(partialRows).join('') || '<div class="empty">Моделей пока нет.</div>';
 
     // Прогресс загрузок.
-    const dl = r.downloads || [];
     if (dl.length) {
       $('dlStatus').className = 'output';
       $('dlStatus').innerHTML = dl.map((d) => {
         const pctv = d.total ? Math.round((d.received / d.total) * 100) : 0;
-        const stateTag = d.status === 'running' ? 'скачивается' : d.status === 'done' ? 'готово' : d.status === 'error' ? 'ошибка' : d.status;
+        const stateTag = d.status === 'running' ? 'скачивается'
+          : d.status === 'done' ? 'готово'
+          : d.status === 'error' ? 'ошибка'
+          : d.status === 'cancelled' ? 'остановлено'
+          : d.status;
         return `<div style="margin-bottom:6px"><b>${esc(d.name)}</b> — ${esc(stateTag)}
           ${d.total ? `(${pctv}%, ${fmtBytes(d.received)} / ${fmtBytes(d.total)})` : `(${fmtBytes(d.received)})`}
+          ${d.status === 'running' ? ` <button class="b b-sm b-r" onclick="openStopDownload('${esc(d.id)}')">Остановить</button>` : ''}
           ${d.error ? `<br><span style="color:var(--bad)">${esc(d.error)}</span>` : ''}</div>`;
       }).join('');
       // Обновляем, пока идёт загрузка.
@@ -825,6 +850,120 @@ async function downloadCustom() {
     toast('Загрузка началась', 'ok');
     state.prevDl[id] = 'running';
     pollJobs();
+    loadModels();
+  } catch (e) {
+    toast('Ошибка: ' + e.message, 'err');
+  }
+}
+
+// ── Остановка загрузки ──
+
+function openStopDownload(id) {
+  const d = (state.downloads || []).find((x) => x.id === id);
+  state.stopDownloadId = id;
+  $('stopDlName').textContent = d ? d.name : modelName(id);
+  $('stopDlMsg').textContent = '';
+  $('stopDlSaved').disabled = false;
+  $('stopDlDelete').disabled = false;
+  $('mStopDownload').classList.add('on');
+}
+
+function closeStopDownload() {
+  state.stopDownloadId = null;
+  $('mStopDownload').classList.remove('on');
+  $('stopDlSaved').disabled = false;
+  $('stopDlDelete').disabled = false;
+}
+
+async function confirmStopDownload(removePartial) {
+  const id = state.stopDownloadId;
+  if (!id) return;
+  const name = $('stopDlName').textContent;
+  $('stopDlSaved').disabled = true;
+  $('stopDlDelete').disabled = true;
+  $('stopDlMsg').className = 'output';
+  $('stopDlMsg').textContent = 'Останавливаю загрузку…';
+  try {
+    try {
+      await api('/api/v1/models/download/cancel', { method: 'POST', body: { id } });
+    } catch (e) {
+      // Загрузка могла завершиться сама — это не мешает убрать остатки.
+      if (!/не выполняется/.test(e.message)) throw e;
+    }
+    if (removePartial) {
+      await api('/api/v1/models/' + encodeURIComponent(id) + '/partial', { method: 'DELETE' });
+    }
+    closeStopDownload();
+    toast(removePartial
+      ? `Загрузка «${name}» остановлена, остатки удалены`
+      : `Загрузка «${name}» остановлена, остатки сохранены`, 'ok');
+    // Свой тост уже показан — не дублируем его из pollJobs.
+    state.prevDl[id] = 'cancelled';
+    pollJobs();
+    loadModels();
+  } catch (e) {
+    $('stopDlMsg').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';
+    $('stopDlSaved').disabled = false;
+    $('stopDlDelete').disabled = false;
+  }
+}
+
+// ── Недокачанные модели после перезапуска ──
+
+function runningDownload(id) {
+  return (state.downloads || []).some((d) => d.id === id && d.status === 'running');
+}
+
+function partialList() {
+  return (state.partials || []).filter((p) =>
+    !(state.files || []).some((f) => f.id === p.id) && !runningDownload(p.id));
+}
+
+function maybeOfferPartials() {
+  if (state.partialsPrompted || !can('models')) return;
+  const list = partialList();
+  if (!list.length) return;
+  state.partialsPrompted = true;
+  renderPartialsModal();
+  $('mPartials').classList.add('on');
+}
+
+function closePartials() {
+  $('mPartials').classList.remove('on');
+}
+
+function renderPartialsModal() {
+  const list = partialList();
+  if (!list.length) { closePartials(); return; }
+  $('partialsBody').innerHTML = list.map(({ id, size }) => {
+    const c = state.catalog.find((x) => x.id === id);
+    const pctv = c && c.size_approx ? Math.min(99, Math.round((size / c.size_approx) * 100)) : null;
+    return `<div class="list-row">
+      <div class="grow">
+        <b>${esc(modelName(id))}</b>
+        <div class="muted mono">${esc(id)} · ${fmtBytes(size)}${pctv !== null ? ` · примерно ${pctv}%` : ''}</div>
+      </div>
+      <div style="white-space:nowrap">
+        <button class="b b-sm b-p" onclick="resumePartial('${esc(id)}')">Продолжить</button>
+        <button class="b b-sm b-r" onclick="deletePartial('${esc(id)}')">Удалить остатки</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function resumePartial(id) {
+  closePartials();
+  await downloadModel(id);
+}
+
+async function deletePartial(id) {
+  const name = modelName(id);
+  if (!confirm(`Удалить недокачанный файл «${name}»? Скачивание придётся начать заново.`)) return;
+  try {
+    await api('/api/v1/models/' + encodeURIComponent(id) + '/partial', { method: 'DELETE' });
+    state.partials = (state.partials || []).filter((p) => p.id !== id);
+    toast('Остатки загрузки удалены', 'ok');
+    renderPartialsModal();
     loadModels();
   } catch (e) {
     toast('Ошибка: ' + e.message, 'err');
@@ -1308,8 +1447,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (e.target === $('mProfile')) closeProfile();
   });
 
-  ['mUser', 'mPass', 'mSetup'].forEach((id) => {
+  ['mUser', 'mPass', 'mSetup', 'mPartials'].forEach((id) => {
     $(id).addEventListener('click', (e) => { if (e.target === $(id)) $(id).classList.remove('on'); });
+  });
+  $('mStopDownload').addEventListener('click', (e) => {
+    if (e.target === $('mStopDownload')) closeStopDownload();
   });
 
   $('iPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
@@ -1394,6 +1536,11 @@ async function pollJobs() {
     }
     if (state.prevDl[d.id] === 'running' && d.status === 'error') {
       toast('Ошибка скачивания ' + d.name + ': ' + (d.error || ''), 'err');
+      dlFinished = true;
+    }
+    if (state.prevDl[d.id] === 'running' && d.status === 'cancelled') {
+      toast('Загрузка остановлена: ' + d.name, 'ok');
+      dlFinished = true;
     }
   });
   state.prevDl = nowDl;

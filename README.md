@@ -15,7 +15,7 @@ student data never leaves your machine.
 - Tables in and out: upload CSV/JSON (several files at once), download the table you are looking at as CSV.
 - Password login and demo data included so you can try it right away.
 
-Current version: **0.0.5**. Detailed Russian documentation lives in [`docs/README.md`](docs/README.md).
+Current version: **0.0.6**. Detailed Russian documentation lives in [`docs/README.md`](docs/README.md).
 
 ## Quick start
 
