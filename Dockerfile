@@ -14,7 +14,13 @@ RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
 
 COPY src ./src
 COPY web ./web
-RUN cargo build --release --locked
+# Docker COPY сохраняет mtime файлов, и Cargo может принять stub-сборку выше
+# за актуальную. Сбрасываем fingerprint пакета и проверяем, что получился
+# настоящий бинарник, а не заглушка.
+RUN cargo clean -p eduquery \
+    && touch src/main.rs \
+    && cargo build --release --locked \
+    && test "$(stat -c %s target/release/eduquery)" -gt 1000000
 
 # ── Runtime ──
 # bookworm: glibc совместим с готовыми сборками llama.cpp (ubuntu-x64/arm64).

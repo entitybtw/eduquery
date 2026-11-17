@@ -85,6 +85,10 @@ docker push <реестр>/eduquery:latest
 Образ двухступенчатый: сборка на `rust:1-bookworm`, запуск на `debian:bookworm-slim`.
 llama.cpp и модели в образ не входят — они скачиваются в `/data`.
 
+При сборке Dockerfile сначала собирает пустую заглушку для кэша зависимостей, затем сбрасывает
+fingerprint пакета и проверяет размер итогового бинарника. Без этого Docker может сохранить
+stub-бинарник: `COPY` приносит старые mtime, и Cargo считает сборку свежей.
+
 `docker-compose.yml` монтирует `./data` и задаёт лимит памяти. Для GigaChat Lightning поднимите
 `EDUQUERY_MEMORY_LIMIT` до `10g`/`12g`. При MTU хоста меньше 1500 задайте `EDUQUERY_MTU`.
 
