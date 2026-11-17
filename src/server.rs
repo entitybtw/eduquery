@@ -19,11 +19,12 @@ use tower_http::trace::TraceLayer;
 use crate::analysis;
 use crate::admin_api;
 use crate::auth::{self, Auth};
-use crate::users::{self, User};
+use crate::bench::{self, BenchState};
 use crate::db::Db;
-use crate::llm::{ChatMessage, Engine, GenParams};
+use crate::llm::{ChatMessage, Engine, GenOutput, GenParams};
 use crate::models::{self, ModelRecord, ModelStore};
 use crate::students;
+use crate::users::{self, User};
 
 /// Общее состояние приложения.
 pub struct AppState {
@@ -33,6 +34,7 @@ pub struct AppState {
     pub auth: Arc<Auth>,
     pub web_dir: PathBuf,
     pub allow_remote_download: bool,
+    pub bench: Arc<BenchState>,
 }
 
 /// Точка входа.
@@ -76,6 +78,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/students", get(list_students))
         .route("/api/v1/students/{id}", get(get_student))
         .route("/api/v1/students/{id}/context", get(student_context))
+        .route("/api/v1/students/{id}/profile", post(update_student_profile))
         .route("/api/v1/students/{id}/records", post(add_record))
         .route("/api/v1/records/{id}", delete(delete_record))
         .route("/api/v1/stats", get(stats))
@@ -96,6 +99,16 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/analyze/compare", post(analyze_compare))
         .route("/api/v1/analyze/overview", post(analyze_overview))
         .route("/api/v1/analyze/ask", post(analyze_ask))
+        .route("/api/v1/analyze/characteristic", post(analyze_characteristic))
+        // ── бенчмарки ──
+        .route("/api/v1/benchmarks", get(bench::list_benchmarks).post(bench::start_benchmark))
+        .route("/api/v1/benchmarks/status", get(bench::bench_status))
+        .route("/api/v1/benchmarks/export.csv", get(bench::export_benchmarks))
+        .route("/api/v1/benchmarks/results/{id}/rating", post(bench::rate_result))
+        .route(
+            "/api/v1/benchmarks/{id}",
+            get(bench::get_benchmark).delete(bench::delete_benchmark),
+        )
         .route("/api/v1/params", get(get_params).post(save_params))
         .route("/api/v1/settings/{key}", get(get_setting).post(set_setting))
         .route("/health", get(health));
@@ -171,6 +184,9 @@ fn required_perm(method: &axum::http::Method, path: &str) -> Need {
         "/api/v1/models/catalog" | "/api/v1/models/status" | "/api/v1/models" if read => Need::Any,
         "/api/v1/params" if read => Need::Any,
         "/api/v1/params" => Need::Perm("models"),
+        "/api/v1/benchmarks/export.csv" => Need::Perm("export"),
+        p if p.starts_with("/api/v1/benchmarks") && read => Need::Any,
+        p if p.starts_with("/api/v1/benchmarks") => Need::Perm("models"),
         p if p.starts_with("/api/v1/users") => Need::Perm("users"),
         p if p.starts_with("/api/v1/export/") => Need::Perm("export"),
         p if p.starts_with("/api/v1/analyze/") => Need::Perm("analyze"),
@@ -270,6 +286,32 @@ where
 
 fn json_err(msg: &str, code: StatusCode) -> Response {
     (code, Json(json!({"error": msg}))).into_response()
+}
+
+/// Записать метрики успешной генерации в журнал использования моделей.
+pub(crate) fn record_usage(db: &Db, model_id: &str, source: &str, out: &GenOutput) {
+    let _ = db.conn().execute(
+        "INSERT INTO usage_metrics(model_id, source, prompt_tokens, completion_tokens,
+                                   duration_ms, tokens_per_sec, loop_detected, ok)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+        rusqlite::params![
+            model_id,
+            source,
+            out.prompt_tokens as i64,
+            out.completion_tokens as i64,
+            out.duration_ms as i64,
+            out.tokens_per_sec,
+            out.loop_detected as i64,
+        ],
+    );
+}
+
+/// Записать неудачную попытку генерации.
+pub(crate) fn record_usage_error(db: &Db, model_id: &str, source: &str, error: &str) {
+    let _ = db.conn().execute(
+        "INSERT INTO usage_metrics(model_id, source, ok, error) VALUES (?1, ?2, 0, ?3)",
+        rusqlite::params![model_id, source, error],
+    );
 }
 
 async fn health() -> impl IntoResponse {
@@ -417,6 +459,19 @@ async fn student_context(State(state): State<Arc<AppState>>, Path(id): Path<i64>
     }
 }
 
+/// Редактирование профиля ученика: ФИО, группа, дата рождения, адрес, семья.
+async fn update_student_profile(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(patch): Json<students::ProfileUpdate>,
+) -> Response {
+    match students::update_profile(&state.db, id, &patch) {
+        Ok(true) => Json(json!({"status": "ok"})).into_response(),
+        Ok(false) => json_err("ученик не найден", StatusCode::NOT_FOUND),
+        Err(e) => json_err(&format!("не удалось сохранить профиль: {e}"), StatusCode::BAD_REQUEST),
+    }
+}
+
 async fn seed_demo(State(state): State<Arc<AppState>>) -> Response {
     match crate::seed::seed(&state.db) {
         Ok(n) => Json(json!({"status": "ok", "activities": n})).into_response(),
@@ -549,6 +604,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({
         "models": list,
         "files": files,
+        "partials": state.store.partials(),
         "active": state.engine.active_model(),
         "loaded": state.engine.loaded_models(),
         "downloads": state.store.downloads(),
@@ -580,7 +636,14 @@ async fn download_model(
     let Some(entry) = models::catalog_entry(&req.id) else {
         return json_err("модель не найдена в каталоге", StatusCode::NOT_FOUND);
     };
-    spawn_download(state.clone(), entry.id.to_string(), entry.name.to_string(), entry.url.to_string());
+    let urls = models::candidate_urls(entry);
+    spawn_download(
+        state.clone(),
+        entry.id.to_string(),
+        entry.name.to_string(),
+        urls,
+        Some(entry.size_approx),
+    );
     Json(json!({"status": "started", "id": entry.id})).into_response()
 }
 
@@ -605,20 +668,26 @@ async fn download_custom(
     if id.is_empty() {
         return json_err("некорректный id", StatusCode::BAD_REQUEST);
     }
-    spawn_download(state.clone(), id, req.name, req.url);
+    spawn_download(state.clone(), id, req.name, vec![req.url], None);
     Json(json!({"status": "started"})).into_response()
 }
 
-fn sanitize_id(s: &str) -> String {
+pub(crate) fn sanitize_id(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .take(64)
         .collect()
 }
 
-fn spawn_download(state: Arc<AppState>, id: String, name: String, url: String) {
+fn spawn_download(
+    state: Arc<AppState>,
+    id: String,
+    name: String,
+    urls: Vec<String>,
+    expected_size: Option<u64>,
+) {
     tokio::spawn(async move {
-        match state.store.download(&id, &name, &url).await {
+        match state.store.download(&id, &name, &urls, expected_size).await {
             Ok(path) => {
                 tracing::info!("модель скачана: {}", path.display());
                 let sha = ModelStore::sha256(&path).unwrap_or_default();
@@ -636,6 +705,12 @@ fn spawn_download(state: Arc<AppState>, id: String, name: String, url: String) {
                         "downloaded"
                     ],
                 );
+                // Первую модель сразу делаем активной, чтобы панель работала без лишних кликов.
+                if state.engine.active_model().is_none() {
+                    state.engine.set_active(&path);
+                    let _ = state.db.set_setting("active_model_id", &id);
+                    tracing::info!("активная модель: {id}");
+                }
             }
             Err(e) => tracing::error!("ошибка скачивания модели {id}: {e}"),
         }
@@ -652,6 +727,9 @@ async fn delete_model(State(state): State<Arc<AppState>>, Path(id): Path<String>
         .db
         .conn()
         .execute("DELETE FROM models WHERE id = ?1", rusqlite::params![id]);
+    if state.db.get_setting("active_model_id").as_deref() == Some(id.as_str()) {
+        let _ = state.db.set_setting("active_model_id", "");
+    }
     Json(json!({"status": "ok"})).into_response()
 }
 
@@ -670,7 +748,9 @@ async fn activate_model(
         return json_err("файл модели не найден — сначала скачайте её", StatusCode::NOT_FOUND);
     }
     state.engine.set_active(&path);
-    Json(json!({"status": "ok", "active": path.to_string_lossy()})) .into_response()
+    let _ = state.db.set_setting("active_model_id", &id);
+    Json(json!({"status": "ok", "active": path.to_string_lossy()}))
+        .into_response()
 }
 
 // ── параметры генерации ──
@@ -738,7 +818,7 @@ pub struct GenRequest {
     #[serde(default)]
     pub system: Option<String>,
     #[serde(default)]
-    pub params: Option<GenParams>,
+    pub params: Option<Value>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -747,37 +827,63 @@ pub struct ChatMsg {
     pub content: String,
 }
 
-/// Собрать список сообщений из запроса.
-fn build_messages(req: &GenRequest, default_system: &str) -> Vec<ChatMessage> {
-    let mut msgs: Vec<ChatMessage> = Vec::new();
-
+/// Собрать список сообщений из запроса: системная инструкция, необязательная
+/// пара «пример запроса → пример ответа» и сами сообщения пользователя.
+fn build_messages(req: &GenRequest, params: &GenParams) -> Vec<ChatMessage> {
     let sys = req
         .system
         .clone()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| default_system.to_string());
+        .unwrap_or_else(|| {
+            if params.system_prompt.trim().is_empty() {
+                analysis::DEFAULT_SYSTEM_PROMPT.to_string()
+            } else {
+                params.system_prompt.clone()
+            }
+        });
 
-    if !sys.trim().is_empty() {
-        msgs.push(ChatMessage { role: "system".into(), content: sys });
-    }
-
+    let mut actual: Vec<ChatMessage> = Vec::new();
     if !req.messages.is_empty() {
         for m in &req.messages {
-            msgs.push(ChatMessage { role: m.role.clone(), content: m.content.clone() });
+            actual.push(ChatMessage { role: m.role.clone(), content: m.content.clone() });
         }
-        return msgs;
+    } else if let Some(p) = &req.prompt {
+        if !p.trim().is_empty() {
+            actual.push(ChatMessage { role: "user".into(), content: p.clone() });
+        }
     }
 
-    if let Some(p) = &req.prompt {
-        if !p.trim().is_empty() {
-            msgs.push(ChatMessage { role: "user".into(), content: p.clone() });
+    compose_messages(&sys, &params.example_input, &params.example_answer, &actual)
+}
+
+/// Склеить системный промпт, few-shot пример и рабочие сообщения.
+pub(crate) fn compose_messages(
+    system: &str,
+    example_input: &str,
+    example_answer: &str,
+    actual: &[ChatMessage],
+) -> Vec<ChatMessage> {
+    let mut msgs: Vec<ChatMessage> = Vec::new();
+    if !system.trim().is_empty() {
+        msgs.push(ChatMessage { role: "system".into(), content: system.to_string() });
+    }
+    if !example_input.trim().is_empty() {
+        msgs.push(ChatMessage { role: "user".into(), content: example_input.to_string() });
+        if !example_answer.trim().is_empty() {
+            msgs.push(ChatMessage { role: "assistant".into(), content: example_answer.to_string() });
         }
+    } else if !example_answer.trim().is_empty() {
+        // Ответ без запроса бессмысленен, но не теряем его молча.
+        msgs.push(ChatMessage { role: "assistant".into(), content: example_answer.to_string() });
+    }
+    for m in actual {
+        msgs.push(m.clone());
     }
     msgs
 }
 
 /// Определить путь активной модели.
-fn resolve_model_path(state: &AppState, model_id: Option<&str>) -> Result<PathBuf, String> {
+pub(crate) fn resolve_model_path(state: &AppState, model_id: Option<&str>) -> Result<PathBuf, String> {
     // Явно переданная модель имеет приоритет.
     if let Some(id) = model_id {
         if !id.trim().is_empty() {
@@ -803,24 +909,55 @@ fn resolve_model_path(state: &AppState, model_id: Option<&str>) -> Result<PathBu
     Err("не выбрана активная модель — скачайте и активируйте её в разделе «Модели»".to_string())
 }
 
-/// Загрузить сохранённые параметры и применить переопределения из запроса.
-fn merged_params(state: &AppState, override_params: Option<&GenParams>) -> GenParams {
+/// Загрузить сохранённые параметры и применить только те переопределения,
+/// которые реально пришли в запросе. Частичный объект `params` не сбрасывает
+/// остальные поля к значениям по умолчанию.
+pub(crate) fn merged_params(state: &AppState, override_params: Option<&Value>) -> GenParams {
     let mut base = match state.db.get_setting("gen_params") {
         Some(raw) => serde_json::from_str::<GenParams>(&raw).unwrap_or_default(),
         None => state.engine.default_params().clone(),
     };
-    if let Some(o) = override_params {
-        base.temperature = o.temperature;
-        base.top_p = o.top_p;
-        base.top_k = o.top_k;
-        base.repeat_penalty = o.repeat_penalty;
-        base.dry_multiplier = o.dry_multiplier;
-        base.max_tokens = o.max_tokens;
-        base.n_ctx = o.n_ctx;
-        base.n_threads = o.n_threads;
-        base.seed = o.seed;
-        if !o.system_prompt.trim().is_empty() {
-            base.system_prompt = o.system_prompt.clone();
+    let Some(o) = override_params else { return base };
+    if let Some(v) = o.get("temperature").and_then(Value::as_f64) {
+        base.temperature = v as f32;
+    }
+    if let Some(v) = o.get("top_p").and_then(Value::as_f64) {
+        base.top_p = v as f32;
+    }
+    if let Some(v) = o.get("top_k").and_then(Value::as_i64) {
+        base.top_k = v as i32;
+    }
+    if let Some(v) = o.get("repeat_penalty").and_then(Value::as_f64) {
+        base.repeat_penalty = v as f32;
+    }
+    if let Some(v) = o.get("dry_multiplier").and_then(Value::as_f64) {
+        base.dry_multiplier = v as f32;
+    }
+    if let Some(v) = o.get("max_tokens").and_then(Value::as_i64) {
+        base.max_tokens = v as i32;
+    }
+    if let Some(v) = o.get("n_ctx").and_then(Value::as_u64) {
+        base.n_ctx = v as u32;
+    }
+    if let Some(v) = o.get("n_threads").and_then(Value::as_i64) {
+        base.n_threads = v as i32;
+    }
+    if let Some(v) = o.get("seed").and_then(Value::as_u64) {
+        base.seed = v;
+    }
+    if let Some(v) = o.get("system_prompt").and_then(Value::as_str) {
+        if !v.trim().is_empty() {
+            base.system_prompt = v.to_string();
+        }
+    }
+    if let Some(v) = o.get("example_input").and_then(Value::as_str) {
+        if !v.trim().is_empty() {
+            base.example_input = v.to_string();
+        }
+    }
+    if let Some(v) = o.get("example_answer").and_then(Value::as_str) {
+        if !v.trim().is_empty() {
+            base.example_answer = v.to_string();
         }
     }
     base
@@ -836,12 +973,7 @@ async fn generate(
     };
 
     let params = merged_params(&state, req.params.as_ref());
-    let default_system = if params.system_prompt.trim().is_empty() {
-        analysis::DEFAULT_SYSTEM_PROMPT.to_string()
-    } else {
-        params.system_prompt.clone()
-    };
-    let msgs = build_messages(&req, &default_system);
+    let msgs = build_messages(&req, &params);
 
     if msgs.is_empty() {
         return json_err("пустой запрос", StatusCode::BAD_REQUEST);
@@ -849,12 +981,22 @@ async fn generate(
 
     let engine = state.engine.clone();
     let model = path.clone();
+    let model_id = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let state2 = state.clone();
     keepalive(async move {
         match engine.generate(&model, &msgs, &params).await {
-            Ok(out) => Json(out).into_response(),
+            Ok(out) => {
+                record_usage(&state2.db, &model_id, "generate", &out);
+                Json(out).into_response()
+            }
             Err(e) => {
                 tracing::error!("generate: {e:#}");
-                json_err(&format!("ошибка генерации: {e:#}"), StatusCode::INTERNAL_SERVER_ERROR)
+                let msg = format!("{e:#}");
+                record_usage_error(&state2.db, &model_id, "generate", &msg);
+                json_err(&format!("ошибка генерации: {msg}"), StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
     })
@@ -870,7 +1012,7 @@ struct AnalyzeStudentReq {
     #[serde(default)]
     model_id: Option<String>,
     #[serde(default)]
-    params: Option<GenParams>,
+    params: Option<Value>,
 }
 
 async fn analyze_student(
@@ -893,7 +1035,7 @@ async fn analyze_student(
         system: None,
         params: req.params,
     };
-    run_analysis(state, gen, Some(req.student_id)).await
+    run_analysis(state, gen, Some(req.student_id), "student").await
 }
 
 #[derive(Deserialize)]
@@ -903,7 +1045,7 @@ struct AnalyzeCompareReq {
     #[serde(default)]
     model_id: Option<String>,
     #[serde(default)]
-    params: Option<GenParams>,
+    params: Option<Value>,
 }
 
 async fn analyze_compare(
@@ -930,7 +1072,7 @@ async fn analyze_compare(
         system: None,
         params: req.params,
     };
-    run_analysis(state, gen, None).await
+    run_analysis(state, gen, None, "compare").await
 }
 
 #[derive(Deserialize)]
@@ -940,7 +1082,7 @@ struct AnalyzeAskReq {
     #[serde(default)]
     model_id: Option<String>,
     #[serde(default)]
-    params: Option<GenParams>,
+    params: Option<Value>,
 }
 
 /// Свободный вопрос по ученику: модель получает его полную статистику.
@@ -964,7 +1106,40 @@ async fn analyze_ask(
         system: None,
         params: req.params,
     };
-    run_analysis(state, gen, Some(req.student_id)).await
+    run_analysis(state, gen, Some(req.student_id), "ask").await
+}
+
+#[derive(Deserialize)]
+struct AnalyzeCharacteristicReq {
+    student_id: i64,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    params: Option<Value>,
+}
+
+/// Официальная характеристика ученика: отдельный промпт и структура документа.
+async fn analyze_characteristic(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AnalyzeCharacteristicReq>,
+) -> Response {
+    let context = match analysis::build_student_context(&state.db, req.student_id) {
+        Ok(c) => c,
+        Err(e) => return json_err(&format!("{e}"), StatusCode::BAD_REQUEST),
+    };
+    let prompt = analysis::build_characteristic_prompt(&context);
+
+    let gen = GenRequest {
+        model_id: req.model_id,
+        messages: vec![ChatMsg {
+            role: "user".into(),
+            content: prompt,
+        }],
+        prompt: None,
+        system: None,
+        params: req.params,
+    };
+    run_analysis(state, gen, Some(req.student_id), "characteristic").await
 }
 
 #[derive(Deserialize)]
@@ -972,7 +1147,7 @@ struct AnalyzeOverviewReq {
     #[serde(default)]
     model_id: Option<String>,
     #[serde(default)]
-    params: Option<GenParams>,
+    params: Option<Value>,
 }
 
 async fn analyze_overview(
@@ -1031,7 +1206,7 @@ async fn analyze_overview(
         system: None,
         params: req.params,
     };
-    run_analysis(state, gen, None).await
+    run_analysis(state, gen, None, "overview").await
 }
 
 /// Общая обёртка запуска анализа + сохранение в БД.
@@ -1039,35 +1214,33 @@ async fn run_analysis(
     state: Arc<AppState>,
     gen: GenRequest,
     student_id: Option<i64>,
+    source: &'static str,
 ) -> Response {
     let path = match resolve_model_path(&state, gen.model_id.as_deref()) {
         Ok(p) => p,
         Err(e) => return json_err(&e, StatusCode::BAD_REQUEST),
     };
     let params = merged_params(&state, gen.params.as_ref());
-    let default_system = if params.system_prompt.trim().is_empty() {
-        analysis::DEFAULT_SYSTEM_PROMPT.to_string()
-    } else {
-        params.system_prompt.clone()
-    };
-    let msgs = build_messages(&gen, &default_system);
+    let msgs = build_messages(&gen, &params);
     let engine = state.engine.clone();
     let model = path.clone();
     let model_id = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
+    let prompt_text = gen
+        .messages
+        .first()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    let state2 = state.clone();
 
     keepalive(async move {
         match engine.generate(&model, &msgs, &params).await {
             Ok(out) => {
+                record_usage(&state2.db, &model_id, source, &out);
                 if let Some(sid) = student_id {
-                    let prompt_text = gen
-                        .messages
-                        .first()
-                        .map(|m| m.content.clone())
-                        .unwrap_or_default();
-                    let _ = state.db.conn().execute(
+                    let _ = state2.db.conn().execute(
                         "INSERT INTO analyses(student_id, model_id, prompt, answer) VALUES (?1, ?2, ?3, ?4)",
                         rusqlite::params![sid, model_id, prompt_text, out.text],
                     );
@@ -1076,7 +1249,9 @@ async fn run_analysis(
             }
             Err(e) => {
                 tracing::error!("analysis: {e:#}");
-                json_err(&format!("ошибка генерации: {e:#}"), StatusCode::INTERNAL_SERVER_ERROR)
+                let msg = format!("{e:#}");
+                record_usage_error(&state2.db, &model_id, source, &msg);
+                json_err(&format!("ошибка генерации: {msg}"), StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
     })

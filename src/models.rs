@@ -1,13 +1,15 @@
 //! Каталог GGUF-моделей: встроенный список, загрузка по URL, обслуживание файлов.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
-/// Прес��топределённая модель из каталога.
+/// Предопределённая модель из каталога.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogEntry {
     pub id: &'static str,
@@ -111,6 +113,31 @@ pub fn catalog_entry(id: &str) -> Option<&'static CatalogEntry> {
     CATALOG.iter().find(|e| e.id == id)
 }
 
+/// Откуда скачивать модель: основной адрес Hugging Face, зеркало из
+/// `EDUQUERY_HF_MIRROR` (если задано) и публичное зеркало hf-mirror.com.
+/// Порядок: сначала настроенное зеркало, затем оригинал, затем запасное.
+pub fn candidate_urls(entry: &CatalogEntry) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    let rest = entry.url.strip_prefix("https://huggingface.co/");
+    if let Ok(mirror) = std::env::var("EDUQUERY_HF_MIRROR") {
+        let mirror = mirror.trim().trim_end_matches('/');
+        if !mirror.is_empty() {
+            if let Some(rest) = rest {
+                urls.push(format!("{mirror}/{rest}"));
+            }
+        }
+    }
+    urls.push(entry.url.to_string());
+    if let Some(rest) = rest {
+        let fallback = format!("https://hf-mirror.com/{rest}");
+        if !urls.iter().any(|u| u == &fallback) {
+            urls.push(fallback);
+        }
+    }
+    urls.dedup();
+    urls
+}
+
 /// Зарегистрированная в БД модель.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRecord {
@@ -140,6 +167,8 @@ pub struct DownloadState {
     pub status: String,
     pub error: Option<String>,
     pub file: Option<String>,
+    /// Текущее зеркало (для диагностики).
+    pub url: Option<String>,
 }
 
 impl ModelStore {
@@ -176,11 +205,64 @@ impl ModelStore {
         out
     }
 
+    /// Недокачанные модели (`.gguf.part`): их можно продолжить, не начиная заново.
+    pub fn partials(&self) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if let Some(id) = name.strip_suffix(".gguf.part") {
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    out.push((id.to_string(), size));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Сверить файлы на диске и таблицу `models`:
+    /// найденные GGUF регистрируются, записи без файла удаляются.
+    pub fn reconcile(&self, db: &crate::db::Db) -> Result<()> {
+        let conn = db.conn();
+        for (id, size) in self.list_files() {
+            let known: Option<String> = conn
+                .query_row("SELECT id FROM models WHERE id = ?1", [&id], |r| r.get(0))
+                .optional()?;
+            if known.is_none() {
+                let path = self.path_for(&id).to_string_lossy().to_string();
+                conn.execute(
+                    "INSERT INTO models(id, name, file_path, size_bytes, sha256, params_json, source)
+                     VALUES (?1, ?1, ?2, ?3, '', '{}', 'local')",
+                    rusqlite::params![id, path, size],
+                )?;
+            }
+        }
+        let rows: Vec<(String, String)> = {
+            let mut stmt = conn.prepare("SELECT id, file_path FROM models")?;
+            let it = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, path) in rows {
+            if !Path::new(&path).exists() {
+                conn.execute("DELETE FROM models WHERE id = ?1", [&id])?;
+            }
+        }
+        Ok(())
+    }
+
     /// Удалить файл модели.
     pub fn delete(&self, id: &str) -> Result<()> {
         let p = self.path_for(id);
         if p.exists() {
             std::fs::remove_file(&p).with_context(|| format!("не удалось удалить {}", p.display()))?;
+        }
+        // Недокачанный файл тоже удаляем, иначе он останется в списке «Продолжить».
+        let part = self.dir.join(format!("{id}.gguf.part"));
+        if part.exists() {
+            std::fs::remove_file(&part)
+                .with_context(|| format!("не удалось удалить {}", part.display()))?;
         }
         Ok(())
     }
@@ -196,11 +278,28 @@ impl ModelStore {
         }
     }
 
-    /// Скачать модель по URL в файл `<id>.gguf`.
-    pub async fn download(&self, id: &str, name: &str, url: &str) -> Result<PathBuf> {
+    /// Скачать модель в файл `<id>.gguf`.
+    ///
+    /// `urls` — список зеркал в порядке приоритета. Недокачанный файл
+    /// `.gguf.part` сохраняется между попытками и перезапусками: скачивание
+    /// продолжается с места обрыва (HTTP Range), а не начинается заново.
+    pub async fn download(
+        &self,
+        id: &str,
+        name: &str,
+        urls: &[String],
+        expected_size: Option<u64>,
+    ) -> Result<PathBuf> {
         let target = self.path_for(id);
         if target.exists() {
+            self.update_download(id, |d| {
+                d.status = "done".into();
+                d.file = Some(target.to_string_lossy().to_string());
+            });
             return Ok(target);
+        }
+        if urls.is_empty() {
+            bail!("нет ссылки для скачивания модели");
         }
 
         let tmp = target.with_extension("gguf.part");
@@ -210,100 +309,179 @@ impl ModelStore {
                 bail!("модель уже скачивается");
             }
             list.retain(|d| d.id != id);
+            let partial = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
             list.push(DownloadState {
                 id: id.to_string(),
                 name: name.to_string(),
-                received: 0,
+                received: partial,
                 total: 0,
                 status: "running".into(),
                 error: None,
                 file: None,
+                url: urls.first().cloned(),
             });
         }
 
         let client = reqwest::Client::builder()
-            .user_agent("eduquery/0.1")
-            .timeout(std::time::Duration::from_secs(60 * 60))
+            .user_agent(concat!("eduquery/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60 * 60))
             .build()
             .context("не удалось создать HTTP-клиент")?;
 
-        let resp = match client.get(url).send().await {
-            Ok(r) => r,
-            Err(e) => {
+        let mut last_err: Option<anyhow::Error> = None;
+        // Несколько кругов по зеркалам: сеть может моргнуть на любом из них.
+        for round in 0..3u32 {
+            for url in urls {
                 self.update_download(id, |d| {
-                    d.status = "error".into();
-                    d.error = Some(format!("сетевая ошибка: {e}"));
+                    d.status = "running".into();
+                    d.error = None;
+                    d.url = Some(url.clone());
                 });
-                return Err(e).context("не удалось скачать модель");
-            }
-        };
+                match self.download_one(&client, url, &tmp, id).await {
+                    Ok(()) => {
+                        // Проверяем GGUF-магию — иначе на диск попадёт HTML-страница.
+                        let mut magic = [0u8; 4];
+                        {
+                            use tokio::io::AsyncReadExt;
+                            let mut f = tokio::fs::File::open(&tmp)
+                                .await
+                                .context("ошибка чтения скачанного файла")?;
+                            let _ = f.read_exact(&mut magic).await;
+                        }
+                        if &magic != b"GGUF" {
+                            let _ = tokio::fs::remove_file(&tmp).await;
+                            let msg = "скачанный файл не является GGUF-моделью (возможно, ссылка устарела)";
+                            self.update_download(id, |d| {
+                                d.status = "error".into();
+                                d.error = Some(msg.into());
+                            });
+                            bail!("{msg}");
+                        }
 
-        if !resp.status().is_success() {
-            let code = resp.status();
-            self.update_download(id, |d| {
-                d.status = "error".into();
-                d.error = Some(format!("HTTP {code}"));
-            });
-            bail!("сервер вернул HTTP {code}");
+                        let size = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+                        if let Some(expected) = expected_size.filter(|s| *s > 0) {
+                            if size * 10 < expected * 9 {
+                                let _ = tokio::fs::remove_file(&tmp).await;
+                                let msg = format!(
+                                    "файл слишком мал: {size} байт вместо ожидаемых ~{expected}; ссылка могла устареть"
+                                );
+                                self.update_download(id, |d| {
+                                    d.status = "error".into();
+                                    d.error = Some(msg.clone());
+                                });
+                                bail!("{msg}");
+                            }
+                        }
+
+                        tokio::fs::rename(&tmp, &target)
+                            .await
+                            .with_context(|| format!("не удалось переместить {}", tmp.display()))?;
+                        self.update_download(id, |d| {
+                            d.status = "done".into();
+                            d.file = Some(target.to_string_lossy().to_string());
+                            d.received = size;
+                            d.total = size;
+                        });
+                        tracing::info!("модель {id} скачана ({size} байт)");
+                        return Ok(target);
+                    }
+                    Err(e) => {
+                        tracing::warn!("не удалось скачать {id} с {url}: {e:#}");
+                        let msg = format!("{e:#}");
+                        last_err = Some(e);
+                        self.update_download(id, |d| d.error = Some(msg));
+                    }
+                }
+            }
+            if round < 2 {
+                let pause = Duration::from_secs(2 * (round as u64 + 1));
+                self.update_download(id, |d| {
+                    d.status = "running".into();
+                    d.error = Some("обрыв связи, повторяю попытку…".into());
+                });
+                tokio::time::sleep(pause).await;
+            }
         }
 
-        let total = resp.content_length().unwrap_or(0);
-        self.update_download(id, |d| d.total = total);
+        let msg = last_err
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_else(|| "не удалось скачать модель".into());
+        self.update_download(id, |d| {
+            d.status = "error".into();
+            d.error = Some(msg.clone());
+        });
+        Err(anyhow!(msg).context("не удалось скачать модель"))
+    }
 
-        let mut file = tokio::fs::File::create(&tmp)
-            .await
-            .with_context(|| format!("не удалось создать {}", tmp.display()))?;
-        let mut stream = resp.bytes_stream();
-        let mut received = 0u64;
-
+    /// Одна попытка скачивания с докачкой. Не удаляет `.part` при обрыве.
+    async fn download_one(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        dest: &Path,
+        id: &str,
+    ) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    self.update_download(id, |d| {
-                        d.status = "error".into();
-                        d.error = Some(e.to_string());
-                    });
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    return Err(e).context("обрыв загрузки");
-                }
-            };
-            file.write_all(&chunk).await.context("ошибка записи")?;
+
+        let have = tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0);
+        let mut req = client.get(url);
+        if have > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("не удалось подключиться к {url}"))?;
+        let status = resp.status();
+        if status.as_u16() == 416 {
+            return Ok(()); // файл уже скачан целиком
+        }
+        if !status.is_success() {
+            bail!("{url}: HTTP {status}");
+        }
+
+        let resumed = status.as_u16() == 206;
+        let total = if resumed {
+            resp.headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.rsplit('/').next())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        } else {
+            resp.content_length().unwrap_or(0)
+        };
+        let mut received = if resumed { have } else { 0 };
+        let mut file = if resumed && have > 0 {
+            tokio::fs::OpenOptions::new().append(true).open(dest).await?
+        } else {
+            tokio::fs::File::create(dest).await?
+        };
+
+        self.update_download(id, |d| {
+            d.received = received;
+            d.total = total;
+        });
+
+        let mut stream = resp.bytes_stream();
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(60), stream.next())
+                .await
+                .map_err(|_| anyhow!("таймаут: нет данных 60 секунд"))?;
+            let Some(chunk) = next else { break };
+            let chunk = chunk?;
+            file.write_all(&chunk).await.context("ошибка записи файла модели")?;
             received += chunk.len() as u64;
             self.update_download(id, |d| d.received = received);
         }
-        file.flush().await.context("ошибка сброса")?;
+        file.flush().await.context("ошибка сброса файла модели")?;
         drop(file);
 
-        // Проверяем GGUF-магию.
-        let mut magic = [0u8; 4];
-        {
-            use tokio::io::AsyncReadExt;
-            let mut f = tokio::fs::File::open(&tmp)
-                .await
-                .context("ошибка чтения скачанного файла")?;
-            let _ = f.read_exact(&mut magic).await;
+        if total > 0 && received < total {
+            bail!("соединение оборвалось: получено {received} из {total} байт");
         }
-        if &magic != b"GGUF" {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            self.update_download(id, |d| {
-                d.status = "error".into();
-                d.error = Some("файл не GGUF".into());
-            });
-            bail!("скачанный файл не является GGUF-моделью");
-        }
-
-        tokio::fs::rename(&tmp, &target)
-            .await
-            .with_context(|| format!("не удалось переместить {}", tmp.display()))?;
-
-        self.update_download(id, |d| {
-            d.status = "done".into();
-            d.file = Some(target.to_string_lossy().to_string());
-        });
-
-        Ok(target)
+        Ok(())
     }
 
     /// sha256 файла.

@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>eduquery</title>
-<meta name="app-version" content="0.0.4">
+<meta name="app-version" content="0.0.5">
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
@@ -37,6 +38,7 @@
         <div class="ntb" data-tab="students" onclick="tab('students')">Ученики</div>
         <div class="ntb" data-tab="stats" onclick="tab('stats')">Статистика</div>
         <div class="ntb" data-tab="analyze" onclick="tab('analyze')">Анализ ИИ</div>
+        <div class="ntb" data-tab="benchmarks" onclick="tab('benchmarks')">Бенчмарки</div>
         <div class="ntb" data-tab="models" onclick="tab('models')">Модели</div>
         <div class="ntb" data-tab="settings" onclick="tab('settings')">Настройки</div>
         <div class="ntb" data-tab="users" onclick="tab('users')" id="tabUsers" style="display:none">Пользователи</div>
@@ -58,7 +60,7 @@
       <div class="sh">
         <span class="sh-t">Обзор потока</span>
         <button class="b" onclick="loadOverview()">Обновить</button>
-        <button class="b b-p" onclick="seedDemo()">Сгенерировать демо-данные</button>
+        <button class="b b-p" data-perm="import" onclick="seedDemo()">Сгенерировать демо-данные</button>
       </div>
       <div class="cards" id="ovCards"></div>
       <div class="grid2">
@@ -71,7 +73,7 @@
           <div id="ovKinds"></div>
         </div>
       </div>
-      <div class="panel">
+      <div class="panel" data-perm="analyze">
         <div class="panel-h">
           <h3>Аналитика по потоку (ИИ)</h3>
           <button class="b b-p" onclick="analyzeOverview()">Запустить</button>
@@ -84,7 +86,7 @@
     <div id="p-students" style="display:none">
       <div class="sh">
         <span class="sh-t">Ученики</span>
-        <input class="search" id="qStudents" placeholder="Поиск по имени, ID, группе…" oninput="loadStudents()">
+        <input class="search" id="qStudents" placeholder="Поиск по имени, ID, группе, семье…" oninput="loadStudents()">
         <select class="search" id="fGroup" onchange="loadStudents()"><option value="">Все группы</option></select>
         <select class="search" id="fSort" onchange="loadStudents()">
           <option value="">Сортировка: по id</option>
@@ -130,6 +132,30 @@
       </div>
     </div>
 
+    <!-- ─────── Профиль ученика (модалка) ─────── -->
+    <div id="mProfile" class="mbg">
+      <div class="md md-wide" onclick="event.stopPropagation()">
+        <div class="md-h">
+          <h2>Профиль ученика</h2>
+          <button class="b" onclick="closeProfile()">Закрыть</button>
+        </div>
+        <div class="form-grid">
+          <div class="fg"><label>ФИО</label><input id="pfName"></div>
+          <div class="fg"><label>Группа / класс</label><input id="pfGroup" placeholder="7А"></div>
+          <div class="fg"><label>Дата рождения</label><input id="pfBirth" placeholder="ГГГГ-ММ-ДД"></div>
+          <div class="fg"><label>Класс (1–11)</label><input id="pfGrade" type="number" min="1" max="11"></div>
+          <div class="fg"><label>Эл. почта</label><input id="pfEmail" type="email"></div>
+          <div class="fg"><label>Адрес проживания</label><input id="pfAddress" placeholder="Город, улица, дом, квартира"></div>
+        </div>
+        <div class="fg"><label>Семья и быт</label>
+          <textarea id="pfFamily" rows="6" placeholder="Родители и другие члены семьи, братья и сёстры, жилищные условия, особенности воспитания и быта"></textarea>
+        </div>
+        <button class="b b-p" onclick="saveProfile()">Сохранить профиль</button>
+        <div class="hint">Эти сведения попадают в промпт анализа и в официальную характеристику. Заполняйте только те данные, которые нужны для работы.</div>
+        <div id="pfMsg" class="output"></div>
+      </div>
+    </div>
+
     <!-- ─────── Анализ ИИ ─────── -->
     <div id="p-analyze" style="display:none">
       <div class="sh"><span class="sh-t">Анализ с ИИ</span>
@@ -153,6 +179,16 @@
       </div>
       <div class="panel">
         <div class="panel-h">
+          <h3>Официальная характеристика</h3>
+          <button class="b" onclick="copyOutput('chOutput')">Копировать текст</button>
+        </div>
+        <div class="fg"><label>Ученик</label><select id="chStudent"></select></div>
+        <button class="b b-p" onclick="analyzeCharacteristic()">Сгенерировать характеристику</button>
+        <div class="hint">Документ по официальной структуре: общие сведения, семья и быт, успеваемость, интересы, особенности характера, отношения, внешний вид, семейное воспитание, профилактический учёт, подпись и дата. Примеры из «Настроек» задают стиль, но не подменяют факты.</div>
+        <div id="chOutput" class="output"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-h">
           <h3>Свободный вопрос по ученику</h3>
         </div>
         <div class="fg"><label>Ученик</label><select id="fqStudent"></select></div>
@@ -163,6 +199,77 @@
       <div class="panel">
         <h3>Результат</h3>
         <div id="anOutput" class="output"></div>
+      </div>
+    </div>
+
+    <!-- ─────── Бенчмарки ─────── -->
+    <div id="p-benchmarks" style="display:none">
+      <div class="sh">
+        <span class="sh-t">Бенчмарки моделей</span>
+        <button class="b" onclick="loadBench()">Обновить</button>
+        <button class="b" data-perm="export" onclick="download('/api/v1/benchmarks/export.csv')">Скачать CSV</button>
+      </div>
+
+      <div class="panel" data-perm="models">
+        <div class="panel-h">
+          <h3>Новый запуск</h3>
+          <span class="muted">Одна задача — несколько моделей — ответы рядом</span>
+        </div>
+        <div class="grid2">
+          <div>
+            <div class="fg"><label>Что сравниваем</label>
+              <select id="bmMode" onchange="bmModeChanged()">
+                <option value="student">Полный разбор ученика</option>
+                <option value="characteristic">Официальная характеристика</option>
+                <option value="custom">Свой запрос</option>
+              </select>
+            </div>
+            <div class="fg" id="bmStudentBox"><label>Ученик</label><select id="bmStudent"></select></div>
+            <div class="fg" id="bmPromptBox" style="display:none"><label>Свой запрос</label>
+              <textarea id="bmPrompt" rows="5" placeholder="Например: перечисли сильные стороны ученика и дай три рекомендации"></textarea>
+            </div>
+            <div class="fg"><label>Название запуска (необязательно)</label>
+              <input id="bmTitle" placeholder="Оставьте пустым — подставится автоматически">
+            </div>
+          </div>
+          <div>
+            <div class="fg"><label>Модели для сравнения</label>
+              <div class="checks" id="bmModels"></div>
+              <div class="hint">Выберите две или больше установленных моделей — они будут вызваны по очереди на одном запросе. Ответы, скорость, токены и зацикливание сохранятся в истории.</div>
+            </div>
+            <button class="b b-p" onclick="startBenchmark()">Запустить сравнение</button>
+          </div>
+        </div>
+        <div id="bmMsg" class="output"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-h">
+          <h3>Ход выполнения</h3>
+          <span id="bmRunningTag"></span>
+        </div>
+        <div id="bmProgress"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-h">
+          <h3>Реальное использование моделей</h3>
+          <span class="muted">Все генерации: разборы, вопросы, характеристики, бенчмарки</span>
+        </div>
+        <div id="bmUsage"></div>
+      </div>
+
+      <div class="panel">
+        <h3>История запусков</h3>
+        <div id="bmHistory"></div>
+      </div>
+
+      <div class="panel" id="bmDetailPanel" style="display:none">
+        <div class="panel-h">
+          <h3 id="bmDetailTitle">Запуск</h3>
+          <button class="b" onclick="closeBenchDetail()">Закрыть</button>
+        </div>
+        <div id="bmDetail"></div>
       </div>
     </div>
 
@@ -189,7 +296,7 @@
         <div id="catalogList"></div>
       </div>
 
-      <div class="panel">
+      <div class="panel" data-perm="models">
         <h3>Своя модель по ссылке</h3>
         <div class="row3">
           <div class="fg"><label>Идентификатор</label><input id="cmId" placeholder="my-model"></div>
@@ -299,7 +406,13 @@
           <h3>Системный промпт</h3>
           <div class="fg"><label>Текст системного промпта</label><textarea id="pSystem" rows="22"></textarea></div>
           <button class="b" onclick="resetSystemPrompt()">Вернуть стандартный</button>
-          <div class="hint">Инструкция, которая отправляется модели с каждым запросом: какие данные она получает, как их трактовать и в каком формате отвечать. После правки нажмите «Сохранить» слева.</div>
+          <div class="hint">Инструкция, которая отправляется модели с каждым запросом: какие данные она получает, как их трактовать и в каком формате отвечать. Системный промпт остаётся отдельным от примера. После правки нажмите «Сохранить» слева.</div>
+
+          <h3 style="margin-top:18px">Пример запроса и ответа (few-shot)</h3>
+          <div class="fg"><label>Пример запроса</label><textarea id="pExampleIn" rows="5" placeholder="Вставьте пример входных данных или вопроса"></textarea></div>
+          <div class="fg"><label>Пример ответа</label><textarea id="pExampleOut" rows="12" placeholder="Ответ, стиль и структуру которого должна повторить модель"></textarea></div>
+          <button class="b" onclick="clearExample()">Очистить пример</button>
+          <div class="hint">Пример отправляется перед реальным запросом парой «запрос — ответ»: модель видит, как нужно оформлять результат. Системный промпт при этом не меняется. Пустые поля отключают пример.</div>
           <div class="panel" style="margin-top:14px">
             <h3>Интерфейс</h3>
             <div class="fg"><label>Акцентный цвет</label><input type="color" id="acPick" oninput="applyAccent(this.value)"></div>

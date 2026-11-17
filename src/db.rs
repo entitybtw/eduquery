@@ -42,6 +42,9 @@ impl Db {
                 group_name   TEXT NOT NULL DEFAULT '',
                 email        TEXT NOT NULL DEFAULT '',
                 grade        INTEGER,
+                birth_date   TEXT NOT NULL DEFAULT '',
+                address      TEXT NOT NULL DEFAULT '',
+                family       TEXT NOT NULL DEFAULT '',
                 created_at   TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -116,9 +119,72 @@ impl Db {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 expires_at TEXT NOT NULL
             );
+
+            -- Бенчмарки: один запуск сравнивает несколько моделей на одной задаче.
+            CREATE TABLE IF NOT EXISTS benchmark_runs (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                finished_at    TEXT,
+                status         TEXT NOT NULL DEFAULT 'running', -- running | done | error
+                mode           TEXT NOT NULL DEFAULT 'custom',  -- student | characteristic | custom
+                title          TEXT NOT NULL DEFAULT '',
+                prompt         TEXT NOT NULL DEFAULT '',
+                student_id     INTEGER,
+                system_prompt  TEXT NOT NULL DEFAULT '',
+                example_input  TEXT NOT NULL DEFAULT '',
+                example_answer TEXT NOT NULL DEFAULT '',
+                params_json    TEXT NOT NULL DEFAULT '{}',
+                error          TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS benchmark_results (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id            INTEGER NOT NULL REFERENCES benchmark_runs(id) ON DELETE CASCADE,
+                model_id          TEXT NOT NULL,
+                model_name        TEXT NOT NULL DEFAULT '',
+                status            TEXT NOT NULL DEFAULT 'pending', -- pending | running | ok | error
+                error             TEXT NOT NULL DEFAULT '',
+                answer            TEXT NOT NULL DEFAULT '',
+                prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                tokens_per_sec    REAL NOT NULL DEFAULT 0,
+                duration_ms       INTEGER NOT NULL DEFAULT 0,
+                loop_detected     INTEGER NOT NULL DEFAULT 0,
+                rating            INTEGER NOT NULL DEFAULT 0,
+                created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_bench_results_run   ON benchmark_results(run_id);
+            CREATE INDEX IF NOT EXISTS idx_bench_results_model ON benchmark_results(model_id);
+
+            -- Журнал реального использования: копим метрики по каждой модели.
+            CREATE TABLE IF NOT EXISTS usage_metrics (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+                model_id          TEXT NOT NULL,
+                source            TEXT NOT NULL DEFAULT '',
+                prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                duration_ms       INTEGER NOT NULL DEFAULT 0,
+                tokens_per_sec    REAL NOT NULL DEFAULT 0,
+                loop_detected     INTEGER NOT NULL DEFAULT 0,
+                ok                INTEGER NOT NULL DEFAULT 1,
+                error             TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_metrics_model ON usage_metrics(model_id, created_at);
             "#,
         )?;
         self.add_columns()?;
+        // Незавершённые бенчмарки после перезапуска больше не «running».
+        self.conn().execute_batch(
+            r#"
+            UPDATE benchmark_results SET status = 'error', error = 'прервано перезапуском сервера'
+             WHERE status IN ('running', 'pending')
+               AND run_id IN (SELECT id FROM benchmark_runs WHERE status = 'running');
+            UPDATE benchmark_runs SET status = 'error', error = 'прервано перезапуском сервера',
+                                      finished_at = datetime('now')
+             WHERE status = 'running';
+            "#,
+        )?;
         Ok(())
     }
 
@@ -139,6 +205,21 @@ impl Db {
         ] {
             if !have.iter().any(|c| c == name) {
                 conn.execute(&format!("ALTER TABLE activities ADD COLUMN {name} {ddl}"), [])?;
+            }
+        }
+        drop(have);
+        let have_students: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(students)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (name, ddl) in [
+            ("birth_date", "TEXT NOT NULL DEFAULT ''"),
+            ("address", "TEXT NOT NULL DEFAULT ''"),
+            ("family", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            if !have_students.iter().any(|c| c == name) {
+                conn.execute(&format!("ALTER TABLE students ADD COLUMN {name} {ddl}"), [])?;
             }
         }
         Ok(())

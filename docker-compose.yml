@@ -1,6 +1,6 @@
 # eduquery — локальная LLM-платформа для анализа учебной деятельности учеников.
 #
-#   cd /home/entitybtw/eduquery
+#   cd <каталог проекта>
 #   cp .env.example .env      # или сгенерируй install.sh (рандомный пароль)
 #   docker compose up -d --build
 #
@@ -31,9 +31,11 @@ services:
       # 0 = автоопределение по числу ядер CPU.
       EDUQUERY_N_THREADS: ${EDUQUERY_N_THREADS:-0}
       # Размер контекста модели в токенах.
-      EDUQUERY_N_CTX: ${EDUQUERY_N_CTX:-4096}
+      EDUQUERY_N_CTX: ${EDUQUERY_N_CTX:-8192}
       # Разрешить скачивание GGUF-моделей из внешней сети.
       EDUQUERY_ALLOW_REMOTE_DOWNLOAD: ${EDUQUERY_ALLOW_REMOTE_DOWNLOAD:-true}
+      # Зеркало Hugging Face для каталога (пусто — оригинал и hf-mirror.com).
+      EDUQUERY_HF_MIRROR: ${EDUQUERY_HF_MIRROR:-}
       # Вход без пароля (только для локальной отладки).
       EDUQUERY_ALLOW_ANONYMOUS: ${EDUQUERY_ALLOW_ANONYMOUS:-false}
       # Вариант движка llama.cpp: пусто = CPU, vulkan = GPU через Vulkan.

@@ -16,6 +16,12 @@ pub struct StudentSummary {
     pub group_name: String,
     pub email: String,
     pub grade: Option<i64>,
+    /// Дата рождения в свободном виде (обычно ГГГГ-ММ-ДД).
+    pub birth_date: String,
+    /// Адрес проживания / регистрации.
+    pub address: String,
+    /// Сведения о семье: родители, братья и сёстры, особенности воспитания.
+    pub family: String,
     pub activities: i64,
     pub avg_score: Option<f64>,
     pub avg_ratio: Option<f64>,
@@ -161,6 +167,7 @@ const ACT_COLS: &str = "id, kind, title, subject, score, max_score, grade, statu
 
 /// Общий SELECT для карточки/списка ученика (без WHERE).
 const SUMMARY_SELECT: &str = "SELECT s.id, s.external_id, s.full_name, s.group_name, s.email, s.grade,
+    s.birth_date, s.address, s.family,
     (SELECT COUNT(*) FROM activities a WHERE a.student_id = s.id AND a.kind NOT IN ('absence','portfolio','behavior','meal')) AS acts,
     (SELECT AVG(a.score) FROM activities a WHERE a.student_id = s.id AND a.score IS NOT NULL) AS avg_score,
     (SELECT AVG(a.score / a.max_score) FROM activities a
@@ -185,19 +192,22 @@ fn map_summary(r: &Row<'_>) -> rusqlite::Result<StudentSummary> {
         group_name: r.get(3)?,
         email: r.get(4)?,
         grade: r.get(5)?,
-        activities: r.get(6)?,
-        avg_score: r.get(7)?,
-        avg_ratio: r.get(8)?,
-        total_minutes: r.get(9)?,
-        last_activity: r.get(10)?,
-        avg_grade: r.get(11)?,
-        absences: r.get(12)?,
-        absences_unexcused: r.get(13)?,
-        portfolio: r.get(14)?,
-        praises: r.get(15)?,
-        remarks: r.get(16)?,
-        meals: r.get(17)?,
-        meals_eaten: r.get(18)?,
+        birth_date: r.get(6)?,
+        address: r.get(7)?,
+        family: r.get(8)?,
+        activities: r.get(9)?,
+        avg_score: r.get(10)?,
+        avg_ratio: r.get(11)?,
+        total_minutes: r.get(12)?,
+        last_activity: r.get(13)?,
+        avg_grade: r.get(14)?,
+        absences: r.get(15)?,
+        absences_unexcused: r.get(16)?,
+        portfolio: r.get(17)?,
+        praises: r.get(18)?,
+        remarks: r.get(19)?,
+        meals: r.get(20)?,
+        meals_eaten: r.get(21)?,
     })
 }
 
@@ -451,11 +461,14 @@ pub fn list_students(
 
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if !query.is_empty() {
-        sql.push_str(" AND (s.full_name LIKE ? OR s.external_id LIKE ? OR s.group_name LIKE ?)");
+        sql.push_str(
+            " AND (s.full_name LIKE ? OR s.external_id LIKE ? OR s.group_name LIKE ? \
+             OR s.family LIKE ? OR s.address LIKE ?)",
+        );
         let like = format!("%{query}%");
-        args.push(Box::new(like.clone()));
-        args.push(Box::new(like.clone()));
-        args.push(Box::new(like));
+        for _ in 0..5 {
+            args.push(Box::new(like.clone()));
+        }
     }
     if !group.is_empty() {
         sql.push_str(" AND s.group_name = ?");
@@ -721,6 +734,12 @@ pub struct ImportRow {
     pub group_name: Option<String>,
     #[serde(default, alias = "email", alias = "эл_почта", alias = "почта", alias = "e_mail", alias = "электронная_почта")]
     pub email: Option<String>,
+    #[serde(default, alias = "birth_date", alias = "дата_рождения", alias = "день_рождения", alias = "дата_рождения_ученика")]
+    pub birth_date: Option<String>,
+    #[serde(default, alias = "address", alias = "адрес", alias = "адрес_проживания", alias = "место_проживания", alias = "домашний_адрес")]
+    pub address: Option<String>,
+    #[serde(default, alias = "family", alias = "семья", alias = "состав_семьи", alias = "сведения_о_семье", alias = "семья_ученика", alias = "родители")]
+    pub family: Option<String>,
     #[serde(default, alias = "subject", alias = "course", alias = "предмет", alias = "дисциплина")]
     pub subject: Option<String>,
     #[serde(default, alias = "title", alias = "task", alias = "название", alias = "задание", alias = "тема", alias = "наименование")]
@@ -882,6 +901,55 @@ pub fn add_record(db: &Db, student_id: i64, row: &ImportRow) -> Result<()> {
     insert_activity(db, student_id, row)
 }
 
+/// Поля профиля ученика, которые можно отредактировать в карточке.
+/// `None` — не менять, пустая строка — очистить.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProfileUpdate {
+    #[serde(default)]
+    pub full_name: Option<String>,
+    #[serde(default)]
+    pub group_name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub grade: Option<i64>,
+    #[serde(default)]
+    pub birth_date: Option<String>,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub family: Option<String>,
+}
+
+/// Обновить профиль ученика. Возвращает `false`, если ученика нет.
+pub fn update_profile(db: &Db, id: i64, p: &ProfileUpdate) -> Result<bool> {
+    let clean = |v: &Option<String>| v.as_ref().map(|s| s.trim().to_string());
+    let grade = p.grade.filter(|g| (1..=11).contains(g));
+    let changed = db.conn().execute(
+        "UPDATE students SET
+            full_name  = COALESCE(?2, full_name),
+            group_name = COALESCE(?3, group_name),
+            email      = COALESCE(?4, email),
+            grade      = COALESCE(?5, grade),
+            birth_date = COALESCE(?6, birth_date),
+            address    = COALESCE(?7, address),
+            family     = COALESCE(?8, family),
+            updated_at = datetime('now')
+         WHERE id = ?1",
+        params![
+            id,
+            clean(&p.full_name),
+            clean(&p.group_name),
+            clean(&p.email),
+            grade,
+            clean(&p.birth_date),
+            clean(&p.address),
+            clean(&p.family),
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
 /// Удалить запись.
 pub fn delete_record(db: &Db, id: i64) -> Result<bool> {
     Ok(db.conn().execute("DELETE FROM activities WHERE id = ?1", params![id])? > 0)
@@ -923,16 +991,22 @@ fn upsert_student(
 
     let group = row.group_name.clone().unwrap_or_default();
     let email = row.email.clone().unwrap_or_default();
+    let birth_date = row.birth_date.clone().unwrap_or_default();
+    let address = row.address.clone().unwrap_or_default();
+    let family = row.family.clone().unwrap_or_default();
 
     if let Some(id) = existing {
         conn.execute(
             "UPDATE students SET
-                full_name = COALESCE(NULLIF(?2,''), full_name),
+                full_name  = COALESCE(NULLIF(?2,''), full_name),
                 group_name = CASE WHEN ?3 <> '' THEN ?3 ELSE group_name END,
                 email      = CASE WHEN ?4 <> '' THEN ?4 ELSE email END,
+                birth_date = CASE WHEN ?5 <> '' THEN ?5 ELSE birth_date END,
+                address    = CASE WHEN ?6 <> '' THEN ?6 ELSE address END,
+                family     = CASE WHEN ?7 <> '' THEN ?7 ELSE family END,
                 updated_at = datetime('now')
              WHERE id = ?1",
-            params![id, full_name.unwrap_or(""), group, email],
+            params![id, full_name.unwrap_or(""), group, email, birth_date, address, family],
         )?;
         result.students_updated += 1;
         return Ok(Some(id));
@@ -946,8 +1020,9 @@ fn upsert_student(
     let name = full_name.unwrap_or(&eid).to_string();
 
     conn.execute(
-        "INSERT INTO students(external_id, full_name, group_name, email) VALUES (?1, ?2, ?3, ?4)",
-        params![eid, name, group, email],
+        "INSERT INTO students(external_id, full_name, group_name, email, birth_date, address, family)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![eid, name, group, email, birth_date, address, family],
     )?;
     result.students_created += 1;
     Ok(Some(conn.last_insert_rowid()))

@@ -28,6 +28,9 @@ impl Config {
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("не удалось создать каталог данных {}", data_dir.display()))?;
         std::fs::create_dir_all(data_dir.join("models")).ok();
+        // Абсолютный путь: llama-server запускается с current_dir(engine), и
+        // относительный путь к бинарнику внутри дочернего процесса уже не найдётся.
+        let data_dir = std::fs::canonicalize(&data_dir).unwrap_or(data_dir);
 
         Ok(Self {
             host: env_or("EDUQUERY_HOST", "0.0.0.0"),
@@ -40,7 +43,7 @@ impl Config {
                 .parse()
                 .unwrap_or(0)
                 .max(0),
-            n_ctx: env_or("EDUQUERY_N_CTX", "4096").parse().unwrap_or(4096),
+            n_ctx: env_or("EDUQUERY_N_CTX", "8192").parse().unwrap_or(8192),
             allow_remote_download: env_bool("EDUQUERY_ALLOW_REMOTE_DOWNLOAD", true),
         })
     }

@@ -219,3 +219,27 @@ body.has-topbar nav{top:25px}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
 @media(max-width:600px){.form-grid{grid-template-columns:1fr}}
 .hide{display:none!important}
+
+/* семья и быт в таблице и карточке */
+.family-cell{max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--t1)}
+.family-kv dd{white-space:pre-wrap}
+
+/* бенчмарки */
+.checks{display:flex;flex-direction:column;gap:7px;max-height:220px;overflow-y:auto;border:1px solid var(--br1);background:var(--b2);padding:9px 11px}
+.check{display:flex;gap:8px;align-items:flex-start;font-size:12px;cursor:pointer;line-height:1.4}
+.check input{width:auto;margin-top:2px;flex-shrink:0}
+.bm-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px}
+.bm-card{border:1px solid var(--br1);background:var(--b2);padding:12px;display:flex;flex-direction:column;min-width:0}
+.bm-card-h{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:8px}
+.bm-metrics{display:flex;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--t2);font-variant-numeric:tabular-nums;margin-bottom:8px}
+.bm-answer{max-height:420px;overflow:auto;border-top:1px solid var(--br1);padding-top:8px;margin-top:0;font-size:13px}
+.bm-error{color:var(--bad);font-size:12px;white-space:pre-wrap;padding:8px 0}
+.bm-rating{display:flex;align-items:center;gap:2px;margin-top:10px;padding-top:8px;border-top:1px solid var(--br1);flex-wrap:wrap}
+.star{background:none;border:none;cursor:pointer;font-size:18px;line-height:1;color:var(--br2);padding:0 1px;font-family:inherit}
+.star:hover,.star.on{color:var(--warn)}
+.bm-static-stars{color:var(--warn);letter-spacing:2px}
+.bm-meta{display:flex;gap:10px;flex-wrap:wrap;align-items:center;font-size:12px;margin-bottom:10px}
+.bm-prompt{margin-bottom:12px;font-size:12px}
+.bm-prompt summary{cursor:pointer;color:var(--t2)}
+.bm-prompt summary:hover{color:var(--accent)}
+@media(max-width:700px){.bm-grid{grid-template-columns:1fr}}

@@ -7,10 +7,15 @@ student data never leaves your machine.
 - Tiny image: the llama.cpp engine and the models are **downloaded automatically** on first run.
 - One container, no external services, no API keys.
 - Journal data beyond grades: **absences with reasons, portfolio (certificates, awards, thanks), behaviour, school meals** — all of it goes into the AI analysis.
+- Student profile includes **date of birth, address and family background**; family context is shown in the table, the student card and the official characteristic.
+- **Official characteristic** generator with a separate document-oriented prompt, plus a separate **few-shot example** field that shows the model the desired style without mixing it into the system prompt.
+- **Benchmarks** tab: run several installed models on the same student review, characteristic or custom prompt, compare answers, speed and tokens, rate answers manually and export the history as CSV.
 - A **Statistics** tab with charts (grades, absences, portfolio, behaviour, meals; per class; student rankings).
 - Multi-user: accounts stored in SQLite, per-user permissions and AI request limits.
 - Tables in and out: upload CSV/JSON (several files at once), download the table you are looking at as CSV.
 - Password login and demo data included so you can try it right away.
+
+Current version: **0.0.5**. Detailed Russian documentation lives in [`docs/README.md`](docs/README.md).
 
 ## Quick start
 
@@ -70,13 +75,15 @@ Everything downloaded is stored in `./data` and survives container rebuilds and 
 | Students | List with grade / absences / portfolio / remarks / meals columns; student card with all sections; add or delete records by hand |
 | Statistics | Charts and counters: grade distribution, grades per subject, absences by reason and month (excused vs. unexcused), portfolio by kind and level, praises vs. remarks by month, meals, monthly trends, class comparison, top-10 student rankings (most remarks, absences, …). Filter by class/group |
 | Student analysis | LLM review of one student's data; result is saved to history |
+| Official characteristic | Document-style characteristic with a dedicated prompt: family, progress, interests, behaviour, relationships, appearance, family upbringing, PDN/VShU/DESOP, signature |
 | Comparison | Compare several students |
 | Ask about data | Free-form question to the LLM about selected data |
+| Benchmarks | Compare several installed models on one task; answers side by side, tokens/s, duration, loop flag, manual 1–5 rating, history and CSV |
 | Import | Upload one or several CSV/JSON tables; optionally replace all current data |
-| Export | Download the current students table (with your search/filter/sort), all activity records, or the analysis history as CSV |
+| Export | Download the current students table (with your search/filter/sort), all activity records, the analysis history or benchmark results as CSV |
 | Users | Create accounts, set permissions and AI request limits (admins only) |
-| Models | Catalog, download by URL, activate, delete |
-| Parameters | temperature, top-p/top-k, repeat penalty, DRY, max tokens, context, system prompt |
+| Models | Catalog, download by URL, activate, delete, resume interrupted downloads |
+| Parameters | temperature, top-p/top-k, repeat penalty, DRY, max tokens, context, system prompt, few-shot example request/answer |
 
 ### What is recorded (record types)
 
@@ -135,7 +142,7 @@ Accounts live in the SQLite database. `EDUQUERY_ADMIN_USER` / `EDUQUERY_ADMIN_PA
   Windows-1251, decimal comma accepted (`8,5`). Tick *replace all current data* to wipe students, activities
   and analyses first. Click **Download template** to get a CSV with an example row of every record type.
 - **Columns and values are in Russian** (English names are accepted too): `ID ученика`, `ФИО`, `Группа`, `Эл. почта`,
-  `Тип записи`, `Предмет`, `Название`, `Дата`, `Балл`, `Макс. балл`, `Оценка`, `Статус`, `Время, мин`,
+  `Дата рождения`, `Адрес`, `Семья`, `Тип записи`, `Предмет`, `Название`, `Дата`, `Балл`, `Макс. балл`, `Оценка`, `Статус`, `Время, мин`,
   `Пропущено уроков`, `Причина пропуска`, `Уважительная`, `Категория`, `Уровень / оплата`, `Комментарий`.
 - **Export**: *Download table (CSV)* saves exactly the table on screen (current search, group filter and sort);
   *Download all records* exports every record in the same Russian format the importer reads, so a file can be
@@ -151,8 +158,9 @@ Accounts live in the SQLite database. `EDUQUERY_ADMIN_USER` / `EDUQUERY_ADMIN_PA
 | `EDUQUERY_ADMIN_PASS` | `admin` | password of the first admin — **change it!** |
 | `EDUQUERY_ALLOW_ANONYMOUS` | `false` | passwordless login (debugging only) |
 | `EDUQUERY_N_THREADS` | `0` | CPU threads, 0 = number of cores |
-| `EDUQUERY_N_CTX` | `4096` | model context size in tokens |
+| `EDUQUERY_N_CTX` | `8192` | model context size in tokens |
 | `EDUQUERY_ALLOW_REMOTE_DOWNLOAD` | `true` | allow installing the engine and downloading models |
+| `EDUQUERY_HF_MIRROR` | — | Hugging Face mirror for catalog downloads (e.g. `https://hf-mirror.com`) |
 | `EDUQUERY_ENGINE_VARIANT` | empty | llama.cpp build: empty = CPU, `vulkan` = GPU via Vulkan |
 | `EDUQUERY_ENGINE_URL` | — | direct `.tar.gz` link to a llama.cpp release (mirror), skips the GitHub API |
 | `EDUQUERY_LLAMA_SERVER` | — | path to your own `llama-server` instead of the downloaded one |
@@ -193,13 +201,20 @@ GET  /api/v1/stats?group=            data for the Statistics tab
 GET  /api/v1/engine/status           POST /api/v1/engine/install        (install: models)
 GET  /api/v1/overview | /groups
 GET  /api/v1/students                /{id}  /{id}/context
+POST /api/v1/students/{id}/profile   edit student profile (permission: import)
 POST /api/v1/seed | /import          demo data / CSV import
 GET  /api/v1/models/catalog | /models | /models/status
 POST /api/v1/models/download | /download/custom | /activate
 DELETE /api/v1/models/{id}
 POST /api/v1/generate                free-form generation
-POST /api/v1/analyze/student | /compare | /overview | /ask
-GET/POST /api/v1/params              generation parameters
+POST /api/v1/analyze/student | /compare | /overview | /ask | /characteristic
+GET/POST /api/v1/params              generation parameters, system prompt, few-shot example
+GET  /api/v1/benchmarks              history + real usage metrics
+POST /api/v1/benchmarks              start a comparison (permission: models)
+GET  /api/v1/benchmarks/status | /{id}
+POST /api/v1/benchmarks/results/{id}/rating
+DELETE /api/v1/benchmarks/{id}
+GET  /api/v1/benchmarks/export.csv   (permission: export)
 ```
 
 Example:
@@ -223,6 +238,7 @@ docker build -t entbtw/eduquery:latest .
 
 Requires Rust ≥ 1.80. Layout: `src/llm.rs` — llama-server management,
 `src/server.rs` — HTTP API, `src/models.rs` — model catalog and downloads,
+`src/bench.rs` — benchmarks and usage journal,
 `src/users.rs` / `auth.rs` — accounts, permissions, limits, sessions,
 `src/admin_api.rs` — users, CSV export, engine endpoints, `src/students.rs` / `analysis.rs` / `labels.rs` — data, Russian labels and prompts, `web/assets/stats.js` — charts, `web/` — the UI.
 
@@ -232,6 +248,9 @@ Requires Rust ≥ 1.80. Layout: `src/llm.rs` — llama-server management,
 - **"no active model selected"** — download and activate a model in the Models section.
 - **Forgot the admin password** — stop the container, delete the `users` rows (`sqlite3 data/eduquery.db "DELETE FROM users"`) and start again: the admin from `EDUQUERY_ADMIN_*` is recreated.
 - **Engine did not download** — check access to github.com (the error is shown in the UI; downloads resume after drops, and if the GitHub API is unreachable a pinned llama.cpp version is fetched directly). Behind a slow/blocked network set `EDUQUERY_ENGINE_URL` to a mirror; see `docker logs eduquery`.
+- **Catalog is empty** — log in and press *Refresh* on the Models tab; the catalog is cached in `localStorage`, and the network request runs only after authentication. Behind a blocked Hugging Face set `EDUQUERY_HF_MIRROR`.
+- **Download stopped midway** — open the Models tab: the model is shown as partially downloaded; press *Resume* and the `.part` file continues from the current byte offset.
+- **Active model is lost after restart** — make sure the GGUF is still in `data/models`; on startup the app reconciles files with the database and restores the saved `active_model_id`, otherwise it selects the first available GGUF.
 - **llama-server exited on startup** — the model file is corrupt / not a GGUF, or there is not enough RAM.
 - **Model outputs garbage or repeats itself** — use a larger model (1.5B), raise
   `repeat_penalty`/DRY in Parameters, increase the context.

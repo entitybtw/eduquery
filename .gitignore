@@ -12,6 +12,11 @@ models/
 *.db-wal
 *.db-shm
 
+# Локальная очередь работ и долгие задачи
+docs/NEXT.md
+next.md
+work/
+
 # Окружение
 .env
 

@@ -110,7 +110,7 @@ function mdToHtml(src) {
     }
     if (!line.trim()) { closeList(); continue; }
     let m;
-    if ((m = line.match(/^#{1,6}\s+(.*)$/))) {
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
       closeList();
       const lvl = Math.min(3, m[1].length);
       html += `<h${lvl}>${inline(m[2])}</h${lvl}>`;
@@ -150,7 +150,7 @@ function setOutput(el, text, loopDetected) {
 
 // ─────────────────────────────── Вкладки ───────────────────────────────
 
-const TABS = ['dashboard', 'students', 'stats', 'analyze', 'models', 'settings', 'users'];
+const TABS = ['dashboard', 'students', 'stats', 'analyze', 'benchmarks', 'models', 'settings', 'users'];
 
 function can(perm) {
   const a = state.me && state.me.account;
@@ -158,7 +158,7 @@ function can(perm) {
   return a.role === 'admin' || (a.perms || []).includes(perm);
 }
 
-const TAB_PERM = { dashboard: 'view', students: 'view', stats: 'view', analyze: 'analyze', models: null, settings: 'models', users: 'users' };
+const TAB_PERM = { dashboard: 'view', students: 'view', stats: 'view', analyze: 'analyze', benchmarks: 'view', models: null, settings: 'models', users: 'users' };
 
 function tabAllowed(t) {
   const need = TAB_PERM[t];
@@ -185,6 +185,7 @@ function tab(name) {
   if (name === 'students') loadStudents();
   if (name === 'stats') loadStats();
   if (name === 'analyze') { loadStudents(); syncStudentSelects(); }
+  if (name === 'benchmarks') { loadStudents(); loadBench(); }
   if (name === 'models') { loadModels(); loadEngine(); }
   if (name === 'settings') loadParams();
   if (name === 'users') loadUsers();
@@ -253,7 +254,7 @@ async function boot() {
   const first = TABS.find((t) => tabAllowed(t) && (t !== 'users'));
   tab(can('view') ? 'dashboard' : (first || 'models'));
   if (can('view')) await loadOverview();
-  await loadModels();
+  await loadCatalog();
 
   // Первый запуск: движок llama.cpp ещё не установлен.
   await pollJobs();
@@ -374,7 +375,7 @@ async function loadStudents() {
           <th class="num" title="Средняя оценка">Оценка</th><th class="num">Результат</th>
           <th class="num" title="Пропущено уроков (без уважительной причины)">Пропуски</th>
           <th class="num">Портфолио</th><th class="num" title="Замечания и нарушения">Замечания</th>
-          <th class="num" title="Доля дней, когда питался">Питание</th><th>Последняя</th><th></th>
+          <th class="num" title="Доля дней, когда питался">Питание</th><th>Семья</th><th>Последняя</th><th></th>
         </tr></thead><tbody>` +
         state.students.map((s) => `<tr>
           <td><b>${esc(s.full_name)}</b><br><span class="mono">${esc(s.external_id)}</span></td>
@@ -385,10 +386,11 @@ async function loadStudents() {
           <td class="num">${s.portfolio}</td>
           <td class="num">${s.remarks}</td>
           <td class="num">${s.meals ? Math.round((s.meals_eaten / s.meals) * 100) + '%' : '—'}</td>
+          <td class="family-cell" title="${esc([s.birth_date, s.address, s.family].filter(Boolean).join(' · '))}">${esc(s.family || '—')}</td>
           <td class="muted">${esc(fmtDate(s.last_activity))}</td>
           <td style="text-align:right;white-space:nowrap">
             <button class="b b-sm" onclick="openStudent(${s.id})">Открыть</button>
-            <button class="b b-sm b-p" onclick="quickAnalyze(${s.id})">ИИ</button>
+            ${can('analyze') ? `<button class="b b-sm b-p" onclick="quickAnalyze(${s.id})">ИИ</button>` : ''}
           </td>
         </tr>`).join('') + '</tbody></table></div>';
     }
@@ -401,7 +403,7 @@ async function loadStudents() {
 function syncStudentSelects() {
   const opts = state.students.map((s) =>
     `<option value="${s.id}">${esc(s.full_name)} (${esc(s.group_name || s.external_id)})</option>`).join('');
-  ['anStudent', 'anA', 'anB', 'fqStudent'].forEach((id) => {
+  ['anStudent', 'anA', 'anB', 'fqStudent', 'chStudent', 'bmStudent'].forEach((id) => {
     const el = $(id);
     if (!el) return;
     const cur = el.value;
@@ -435,6 +437,17 @@ async function openStudent(id) {
       <div class="card"><div class="k">Поощрений / замечаний</div><div class="v">${s.praises} / ${s.remarks}</div></div>
       <div class="card"><div class="k">Время на работы</div><div class="v">${s.total_minutes != null ? Math.round(s.total_minutes / 60) + ' ч' : '—'}</div></div>
     </div>`;
+
+    const famRows = [];
+    if (s.birth_date) famRows.push(['Дата рождения', s.birth_date]);
+    if (s.address) famRows.push(['Адрес', s.address]);
+    if (s.family) famRows.push(['Семья и быт', s.family]);
+    html += `<div class="sec"><div class="sec-t" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+      <span>Семья и быт</span>${can('import') ? `<button class="b b-sm" onclick="openProfile(${s.id})">Изменить профиль</button>` : ''}</div>`;
+    html += famRows.length
+      ? `<dl class="kv family-kv">` + famRows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('') + '</dl>'
+      : '<div class="muted">Сведения не заполнены. Добавьте дату рождения, адрес и информацию о семье.</div>';
+    html += '</div>';
 
     if (d.strengths.length) {
       html += `<div class="sec"><div class="sec-t">Сильные стороны</div><ul>` +
@@ -480,8 +493,10 @@ async function openStudent(id) {
     html += studentExtras(d);
 
     html += `<div class="sec" style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="b b-p" onclick="analyzeStudent(${s.id})">Полный разбор (ИИ)</button>
-      <button class="b" onclick="askAbout(${s.id})">Задать вопрос</button>
+      ${can('analyze') ? `<button class="b b-p" onclick="analyzeStudent(${s.id})">Полный разбор (ИИ)</button>
+      <button class="b" onclick="characteristicFor(${s.id})">Официальная характеристика</button>
+      <button class="b" onclick="askAbout(${s.id})">Задать вопрос</button>` : ''}
+      ${can('import') ? `<button class="b" onclick="openProfile(${s.id})">Изменить профиль</button>` : ''}
     </div>`;
 
     $('sdBody').innerHTML = html;
@@ -508,6 +523,80 @@ function statusTag(s) {
 
 function closeStudent() {
   $('mStudent').classList.remove('on');
+}
+
+// ─────────────────────────────── Профиль ученика ───────────────────────────────
+
+let profileStudentId = null;
+
+async function openProfile(id) {
+  const sid = id || (state.currentStudent && state.currentStudent.summary.id);
+  if (!sid) { toast('Сначала откройте ученика', 'err'); return; }
+  try {
+    const d = await api('/api/v1/students/' + sid);
+    const s = d.summary;
+    profileStudentId = s.id;
+    $('pfName').value = s.full_name || '';
+    $('pfGroup').value = s.group_name || '';
+    $('pfGrade').value = s.grade != null ? s.grade : '';
+    $('pfBirth').value = s.birth_date || '';
+    $('pfEmail').value = s.email || '';
+    $('pfAddress').value = s.address || '';
+    $('pfFamily').value = s.family || '';
+    $('pfMsg').textContent = '';
+    $('mProfile').classList.add('on');
+  } catch (e) {
+    toast('Ошибка: ' + e.message, 'err');
+  }
+}
+
+function closeProfile() { $('mProfile').classList.remove('on'); }
+
+async function saveProfile() {
+  if (!profileStudentId) return;
+  const body = {
+    full_name: $('pfName').value.trim(),
+    group_name: $('pfGroup').value.trim(),
+    email: $('pfEmail').value.trim(),
+    birth_date: $('pfBirth').value.trim(),
+    address: $('pfAddress').value.trim(),
+    family: $('pfFamily').value.trim(),
+  };
+  const g = Math.round(+$('pfGrade').value || 0);
+  if (g >= 1 && g <= 11) body.grade = g;
+  try {
+    await api(`/api/v1/students/${profileStudentId}/profile`, { method: 'POST', body });
+    closeProfile();
+    toast('Профиль сохранён', 'ok');
+    await loadStudents();
+    await openStudent(profileStudentId);
+  } catch (e) {
+    $('pfMsg').className = 'output';
+    $('pfMsg').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';
+  }
+}
+
+async function copyOutput(id) {
+  const el = $(id);
+  const text = (el && (el.innerText || el.textContent)) || '';
+  if (!text.trim()) { toast('Пока нечего копировать', 'err'); return; }
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Текст скопирован', 'ok');
+  } catch {
+    try {
+      const r = document.createRange();
+      r.selectNodeContents(el);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(r);
+      document.execCommand('copy');
+      sel.removeAllRanges();
+      toast('Текст скопирован', 'ok');
+    } catch {
+      toast('Не удалось скопировать — выделите текст вручную', 'err');
+    }
+  }
 }
 
 // ─────────────────────────────── Импорт ───────────────────────────────
@@ -593,46 +682,76 @@ function exportStudents() {
 
 // ─────────────────────────────── Модели ───────────────────────────────
 
+function pairOf(x) {
+  return Array.isArray(x) ? { id: String(x[0] ?? ''), size: Number(x[1]) || 0 } : { id: String(x.id ?? ''), size: Number(x.size) || 0 };
+}
+
+function activeId() {
+  return String(state.activeModel || '').split('/').pop().replace(/\.gguf$/, '');
+}
+
+function modelName(id) {
+  const c = state.catalog.find((x) => x.id === id);
+  return c ? c.name : id;
+}
+
 async function loadModels() {
   try {
     const r = await api('/api/v1/models');
     state.models = r.models || [];
     state.activeModel = r.active || '';
+    const files = (r.files || []).map(pairOf);
+    const partials = (r.partials || []).map(pairOf);
+    const active = activeId();
+    const manage = can('models');
 
     $('catalogList').innerHTML = state.catalog.length ? state.catalog.map((c) => {
-      const file = (r.files || []).find((f) => f[0] === c.id);
-      const downloaded = file || state.models.find((m) => m.id === c.id);
-      const active = state.activeModel && state.activeModel.includes(c.id);
+      const file = files.find((f) => f.id === c.id);
+      const part = partials.find((p) => p.id === c.id);
+      const isActive = active === c.id;
+      const partPct = part && c.size_approx ? Math.min(99, Math.round((part.size / c.size_approx) * 100)) : 0;
       return `<div class="list-row">
         <div class="grow">
           <b>${esc(c.name)}</b> <span class="tag">${esc(c.params)}</span>
           ${c.recommended ? '<span class="tag tag-a">рекомендуется</span>' : ''}
-          ${active ? '<span class="tag tag-ok">активна</span>' : ''}
+          ${isActive ? '<span class="tag tag-ok">активна</span>' : ''}
+          ${part && !file ? `<span class="tag tag-w">недокачано ${partPct}%</span>` : ''}
           <div class="muted" style="margin-top:3px">${esc(c.description)}</div>
           <div class="muted" style="margin-top:2px">${fmtBytes(c.size_approx)} · нужно RAM: ${c.min_ram_mb} МБ</div>
         </div>
         <div style="text-align:right;white-space:nowrap">
-          ${downloaded
-            ? `<button class="b b-sm b-g" onclick="activateModel('${esc(c.id)}')">${active ? 'Активна' : 'Сделать активной'}</button>
-               <button class="b b-sm b-r" onclick="deleteModel('${esc(c.id)}')">Удалить</button>`
-            : `<button class="b b-sm b-p" onclick="downloadModel('${esc(c.id)}')">Скачать</button>`}
+          ${!manage
+            ? (isActive ? '<span class="tag tag-ok">активна</span>' : '')
+            : file
+              ? `<button class="b b-sm b-g" onclick="activateModel('${esc(c.id)}')">${isActive ? 'Активна' : 'Сделать активной'}</button>
+                 <button class="b b-sm b-r" onclick="deleteModel('${esc(c.id)}')">Удалить</button>`
+              : part
+                ? `<button class="b b-sm b-p" onclick="downloadModel('${esc(c.id)}')">Продолжить (${fmtBytes(part.size)})</button>
+                   <button class="b b-sm b-r" onclick="deleteModel('${esc(c.id)}')">Удалить</button>`
+                : `<button class="b b-sm b-p" onclick="downloadModel('${esc(c.id)}')">Скачать</button>`}
         </div>
       </div>`;
-    }).join('') : '<div class="empty">Загрузка каталога…</div>';
+    }).join('') : '<div class="empty">Каталог недоступен. Нажмите «Обновить» или проверьте подключение к сети.</div>';
 
-    const installed = (r.files || []).length ? (r.files || []).map(([id, size]) => {
-      const active = state.activeModel && state.activeModel.includes(id);
-      return `<div class="list-row">
-        <div class="grow"><b>${esc(id)}</b> ${active ? '<span class="tag tag-ok">активна</span>' : ''}
-        <div class="muted">${fmtBytes(size)}</div></div>
+    const installedRows = files.map(({ id, size }) => `<div class="list-row">
+        <div class="grow"><b>${esc(modelName(id))}</b>
+        <div class="muted mono">${esc(id)} · ${fmtBytes(size)}</div></div>
         <div style="white-space:nowrap">
-          <button class="b b-sm b-g" onclick="activateModel('${esc(id)}')">Активировать</button>
-          <button class="b b-sm b-r" onclick="deleteModel('${esc(id)}')">Удалить</button>
+          ${manage
+            ? (active === id ? '<span class="tag tag-ok">активна</span>' : `<button class="b b-sm b-g" onclick="activateModel('${esc(id)}')">Активировать</button>`)
+              + `<button class="b b-sm b-r" onclick="deleteModel('${esc(id)}')">Удалить</button>`
+            : (active === id ? '<span class="tag tag-ok">активна</span>' : '')}
         </div>
-      </div>`;
-    }).join('') : '<div class="empty">Моделей пока нет.</div>';
-
-    $('modelList').innerHTML = installed;
+      </div>`);
+    const partialRows = partials.filter((p) => !files.some((f) => f.id === p.id)).map(({ id, size }) => `<div class="list-row">
+        <div class="grow"><b>${esc(modelName(id))}</b>
+        <div class="muted mono">${esc(id)} · недокачано ${fmtBytes(size)}</div></div>
+        <div style="white-space:nowrap">
+          ${manage ? `<button class="b b-sm b-p" onclick="downloadModel('${esc(id)}')">Продолжить</button>
+          <button class="b b-sm b-r" onclick="deleteModel('${esc(id)}')">Удалить</button>` : ''}
+        </div>
+      </div>`);
+    $('modelList').innerHTML = installedRows.concat(partialRows).join('') || '<div class="empty">Моделей пока нет.</div>';
 
     // Прогресс загрузок.
     const dl = r.downloads || [];
@@ -640,28 +759,47 @@ async function loadModels() {
       $('dlStatus').className = 'output';
       $('dlStatus').innerHTML = dl.map((d) => {
         const pctv = d.total ? Math.round((d.received / d.total) * 100) : 0;
-        return `<div style="margin-bottom:6px"><b>${esc(d.name)}</b> — ${esc(d.status)}
+        const stateTag = d.status === 'running' ? 'скачивается' : d.status === 'done' ? 'готово' : d.status === 'error' ? 'ошибка' : d.status;
+        return `<div style="margin-bottom:6px"><b>${esc(d.name)}</b> — ${esc(stateTag)}
           ${d.total ? `(${pctv}%, ${fmtBytes(d.received)} / ${fmtBytes(d.total)})` : `(${fmtBytes(d.received)})`}
           ${d.error ? `<br><span style="color:var(--bad)">${esc(d.error)}</span>` : ''}</div>`;
       }).join('');
       // Обновляем, пока идёт загрузка.
       if (dl.some((d) => d.status === 'running')) setTimeout(loadModels, 1200);
+    } else if ($('dlStatus').textContent.trim() === '' && partials.length) {
+      $('dlStatus').className = 'output';
+      $('dlStatus').innerHTML = '<span class="muted">Есть недокачанные модели: нажмите «Продолжить», и загрузка пойдёт с места обрыва.</span>';
     }
 
     updateActiveLabel();
   } catch (e) {
     toast('Ошибка загрузки моделей: ' + e.message, 'err');
+    if (!$('catalogList').innerHTML.trim()) {
+      $('catalogList').innerHTML = '<div class="empty">Не удалось загрузить каталог. Проверьте сеть и нажмите «Обновить».</div>';
+    }
   }
 }
 
+function restoreCatalogCache() {
+  try {
+    const raw = localStorage.getItem('eq-catalog');
+    const cached = raw ? JSON.parse(raw) : null;
+    if (Array.isArray(cached)) state.catalog = cached;
+  } catch { /* кэш повреждён — просто загрузим заново */ }
+}
+
 async function loadCatalog() {
+  restoreCatalogCache();
   try {
     const r = await api('/api/v1/models/catalog');
-    state.catalog = r.catalog || [];
-    loadModels();
+    if (Array.isArray(r.catalog)) {
+      state.catalog = r.catalog;
+      try { localStorage.setItem('eq-catalog', JSON.stringify(r.catalog)); } catch { /* переполнение кэша */ }
+    }
   } catch (e) {
-    toast('Ошибка каталога: ' + e.message, 'err');
+    if (!state.catalog.length) toast('Не удалось загрузить каталог: ' + e.message, 'err');
   }
+  await loadModels();
 }
 
 async function downloadModel(id) {
@@ -729,6 +867,8 @@ async function loadParams() {
     $('pThreads').value = p.n_threads;
     $('pSeed').value = p.seed;
     $('pSystem').value = p.system_prompt || '';
+    $('pExampleIn').value = p.example_input || '';
+    $('pExampleOut').value = p.example_answer || '';
   } catch (e) {
     toast('Ошибка: ' + e.message, 'err');
   }
@@ -746,6 +886,8 @@ async function saveParams() {
     n_threads: +$('pThreads').value,
     seed: +$('pSeed').value,
     system_prompt: $('pSystem').value,
+    example_input: $('pExampleIn').value,
+    example_answer: $('pExampleOut').value,
   };
   try {
     await api('/api/v1/params', { method: 'POST', body });
@@ -757,8 +899,13 @@ async function saveParams() {
   }
 }
 
-// ─────────────────────────────── Анализ ───────────────────────────────
+function clearExample() {
+  $('pExampleIn').value = '';
+  $('pExampleOut').value = '';
+  toast('Пример очищен — не забудьте сохранить параметры', 'ok');
+}
 
+// ─────────────────────────────── Анализ ───────────────────────────────
 function requireModel() {
   if (state.engine && !state.engine.installed) {
     toast('Сначала установите движок llama.cpp (вкладка «Модели»)', 'err');
@@ -799,6 +946,31 @@ async function quickAnalyze(id) {
   await analyzeStudent(id);
 }
 
+async function analyzeCharacteristic() {
+  if (!requireModel()) return;
+  const sid = $('chStudent').value;
+  if (!sid) { toast('Выберите ученика', 'err'); return; }
+  const out = $('chOutput');
+  busy(out, 'Модель составляет характеристику…');
+  try {
+    const r = await api('/api/v1/analyze/characteristic', {
+      method: 'POST',
+      body: { student_id: +sid },
+    });
+    setOutput(out, r.text, r.loop_detected);
+  } catch (e) {
+    out.className = 'output';
+    out.innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';
+  }
+}
+
+async function characteristicFor(id) {
+  $('chStudent').value = String(id);
+  $('mStudent').classList.remove('on');
+  tab('analyze');
+  await analyzeCharacteristic();
+}
+
 async function analyzeCompare() {
   if (!requireModel()) return;
   const a = $('anA').value, b = $('anB').value;
@@ -824,7 +996,7 @@ async function analyzeOverview() {
     setOutput(out, r.text, r.loop_detected);
   } catch (e) {
     out.className = 'output';
-    out.innerHTML = '<span style="color(--bad)">' + esc(e.message) + '</span>';
+    out.innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';
   }
 }
 
@@ -853,15 +1025,287 @@ async function askAbout(id) {
   $('fqText').focus();
 }
 
+// ─────────────────────────────── Бенчмарки ───────────────────────────────
+
+const bm = {
+  selected: new Set(),
+  files: [],
+  wasRunning: false,
+  detailRun: null,
+};
+
+let benchPollTimer = null;
+
+const BM_MODES = { student: 'Разбор ученика', characteristic: 'Характеристика', custom: 'Свой запрос' };
+const fmtBm = (v, digits = 1) => (v == null ? '—' : (Math.round(v * 10 ** digits) / 10 ** digits).toString().replace('.', ','));
+
+function bmModeChanged() {
+  const mode = $('bmMode').value;
+  $('bmStudentBox').style.display = mode === 'custom' ? 'none' : '';
+  $('bmPromptBox').style.display = mode === 'custom' ? '' : 'none';
+}
+
+function bmToggleModel(id, checked) {
+  if (checked) bm.selected.add(id);
+  else bm.selected.delete(id);
+}
+
+function renderBenchModels() {
+  $('bmModels').innerHTML = bm.files.length ? bm.files.map(({ id, size }) => `<label class="check">
+      <input type="checkbox" value="${esc(id)}" ${bm.selected.has(id) ? 'checked' : ''} onchange="bmToggleModel(this.value, this.checked)">
+      <span><b>${esc(modelName(id))}</b> <span class="muted">${esc(id)} · ${fmtBytes(size)}</span></span>
+    </label>`).join('') : '<div class="muted">Нет установленных моделей. Скачайте их во вкладке «Модели».</div>';
+}
+
+function renderBenchHistory(runs) {
+  if (!runs.length) {
+    $('bmHistory').innerHTML = '<div class="empty">Запусков пока нет.</div>';
+    return;
+  }
+  $('bmHistory').innerHTML = `<table><thead><tr>
+    <th>Дата</th><th>Запуск</th><th>Режим</th><th class="num">Готово</th><th class="num">Оценка</th>
+    <th class="num">Ток/с</th><th class="num">Токенов</th><th></th>
+  </tr></thead><tbody>` + runs.map((r) => `<tr>
+    <td class="muted" style="white-space:nowrap">${esc(fmtDate(r.created_at))}</td>
+    <td><b>${esc(r.title)}</b>${r.status === 'done' && r.errors ? ` <span class="tag tag-r">ошибок: ${r.errors}</span>` : ''}</td>
+    <td>${esc(BM_MODES[r.mode] || r.mode)}</td>
+    <td class="num">${r.ok} / ${r.total}</td>
+    <td class="num">${r.avg_rating != null ? fmtBm(r.avg_rating, 2) : '—'}</td>
+    <td class="num">${r.avg_tps != null ? fmtBm(r.avg_tps) : '—'}</td>
+    <td class="num">${r.tokens != null ? r.tokens : '—'}</td>
+    <td style="text-align:right;white-space:nowrap">
+      <button class="b b-sm" onclick="openBench(${r.id})">Ответы</button>
+      ${can('models') ? `<button class="b b-sm b-r" onclick="deleteBench(${r.id})">Удалить</button>` : ''}
+    </td>
+  </tr>`).join('') + '</tbody></table>';
+}
+
+function renderBenchUsage(usage) {
+  if (!usage.length) {
+    $('bmUsage').innerHTML = '<div class="empty">Пока нет ни одной генерации.</div>';
+    return;
+  }
+  $('bmUsage').innerHTML = `<table><thead><tr>
+    <th>Модель</th><th class="num">Запросов</th><th class="num">Токенов ответа</th>
+    <th class="num">Ток/с</th><th class="num">Зацикливаний</th><th class="num">Ошибок</th><th>Последний раз</th>
+  </tr></thead><tbody>` + usage.map((u) => `<tr>
+    <td><b>${esc(modelName(u.model_id))}</b><div class="muted mono">${esc(u.model_id)}</div></td>
+    <td class="num">${u.calls}</td>
+    <td class="num">${u.completion_tokens != null ? u.completion_tokens : '—'}</td>
+    <td class="num">${u.avg_tps != null ? fmtBm(u.avg_tps) : '—'}</td>
+    <td class="num">${u.loops || 0}</td>
+    <td class="num">${u.errors || 0}</td>
+    <td class="muted" style="white-space:nowrap">${esc(fmtDate(u.last_used))}</td>
+  </tr>`).join('') + '</tbody></table>';
+}
+
+function renderBenchProgress(st) {
+  const tag = $('bmRunningTag');
+  if (!st.running) {
+    tag.innerHTML = '';
+    $('bmProgress').innerHTML = '<div class="muted">Нет активного запуска. Выберите модели и запустите сравнение.</div>';
+    return;
+  }
+  bm.wasRunning = true;
+  const p = st.progress || {};
+  const total = p.total || 0;
+  const done = p.done || 0;
+  const pctv = total ? Math.round((done / total) * 100) : 0;
+  tag.innerHTML = '<span class="tag tag-w">выполняется</span>';
+  $('bmProgress').innerHTML = `<div style="margin-bottom:6px"><b>${esc(p.title || 'Бенчмарк')}</b>
+      <span class="muted">· ${esc(BM_MODES[p.mode] || p.mode || '')} · ${esc(fmtDate(p.created_at))}</span></div>
+    <div class="bar" style="height:8px"><i style="width:${pctv}%"></i></div>
+    <div class="muted" style="margin-top:5px">Готово ${done} из ${total}${p.current ? ` · сейчас: ${esc(p.current)}` : ''}</div>`;
+}
+
+function scheduleBenchPoll(delay = 1200) {
+  clearTimeout(benchPollTimer);
+  benchPollTimer = setTimeout(pollBench, delay);
+}
+
+async function pollBench() {
+  try {
+    const st = await api('/api/v1/benchmarks/status');
+    renderBenchProgress(st);
+    if (st.running) {
+      scheduleBenchPoll(1500);
+    } else if (bm.wasRunning) {
+      bm.wasRunning = false;
+      toast('Бенчмарк завершён', 'ok');
+      loadBench();
+    }
+  } catch {
+    scheduleBenchPoll(3000);
+  }
+}
+
+async function loadBench() {
+  try {
+    const [models, data] = await Promise.all([
+      api('/api/v1/models'),
+      api('/api/v1/benchmarks'),
+    ]);
+    bm.files = (models.files || []).map(pairOf);
+    state.models = models.models || [];
+    state.activeModel = models.active || '';
+    updateActiveLabel();
+
+    const available = bm.files.map((f) => f.id);
+    bm.selected = new Set([...bm.selected].filter((id) => available.includes(id)));
+    if (!bm.selected.size && available.length) {
+      available.slice(0, Math.min(3, available.length)).forEach((id) => bm.selected.add(id));
+    }
+    renderBenchModels();
+    renderBenchHistory(data.runs || []);
+    renderBenchUsage(data.usage || []);
+    if (data.running) {
+      bm.wasRunning = true;
+      await pollBench();
+    } else if (!bm.wasRunning) {
+      renderBenchProgress({ running: 0 });
+    }
+  } catch (e) {
+    toast('Ошибка бенчмарков: ' + e.message, 'err');
+  }
+}
+
+async function startBenchmark() {
+  const ids = [...bm.selected];
+  if (!ids.length) { toast('Выберите хотя бы одну модель', 'err'); return; }
+  const mode = $('bmMode').value;
+  const body = {
+    mode,
+    model_ids: ids,
+    title: $('bmTitle').value.trim(),
+  };
+  if (mode === 'custom') {
+    body.prompt = $('bmPrompt').value.trim();
+    if (!body.prompt) { toast('Введите запрос', 'err'); return; }
+  } else {
+    const sid = $('bmStudent').value;
+    if (!sid) { toast('Выберите ученика', 'err'); return; }
+    body.student_id = +sid;
+  }
+  try {
+    const r = await api('/api/v1/benchmarks', { method: 'POST', body });
+    $('bmMsg').className = 'output';
+    $('bmMsg').innerHTML = `<span style="color:var(--ok)">Запуск #${r.id} начат.</span>`;
+    $('bmTitle').value = '';
+    bm.wasRunning = true;
+    toast('Сравнение запущено', 'ok');
+    await pollBench();
+  } catch (e) {
+    $('bmMsg').className = 'output';
+    $('bmMsg').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';
+  }
+}
+
+function benchResultCard(r, runId) {
+  const status = r.status === 'ok'
+    ? '<span class="tag tag-ok">готово</span>'
+    : r.status === 'running'
+      ? '<span class="tag tag-w">выполняется</span>'
+      : r.status === 'error'
+        ? '<span class="tag tag-r">ошибка</span>'
+        : '<span class="tag">в очереди</span>';
+  const stars = can('models')
+    ? [1, 2, 3, 4, 5].map((n) =>
+      `<button class="star ${n <= r.rating ? 'on' : ''}" title="${n} из 5" onclick="rateBench(${r.id}, ${n}, ${runId})">★</button>`).join('')
+      + (r.rating ? `<button class="b b-sm" style="margin-left:6px" onclick="rateBench(${r.id}, 0, ${runId})">Сбросить</button>` : '')
+    : `<span class="bm-static-stars">${'★'.repeat(r.rating || 0)}${'☆'.repeat(5 - (r.rating || 0))}</span>`;
+  const answer = r.status === 'ok'
+    ? `<div class="bm-answer md output">${mdToHtml(r.answer) || '<span class="muted">Пустой ответ.</span>'}</div>`
+    : r.status === 'error'
+      ? `<div class="bm-error">${esc(r.error || 'ошибка генерации')}</div>`
+      : `<div class="muted" style="padding:12px 0">${r.status === 'running' ? 'Модель отвечает…' : 'Ожидает очереди.'}</div>`;
+  return `<div class="bm-card">
+    <div class="bm-card-h">
+      <div><b>${esc(r.model_name)}</b><div class="muted mono">${esc(r.model_id)}</div></div>
+      ${status}
+    </div>
+    <div class="bm-metrics">
+      <span title="Скорость генерации">${r.tokens_per_sec ? fmtBm(r.tokens_per_sec) + ' ток/с' : '—'}</span>
+      <span title="Токены запроса / ответа">${r.prompt_tokens} / ${r.completion_tokens} ток.</span>
+      <span title="Время генерации">${r.duration_ms ? fmtBm(r.duration_ms / 1000) + ' с' : '—'}</span>
+      ${r.loop_detected ? '<span class="tag tag-w">зацикливание</span>' : ''}
+    </div>
+    ${answer}
+    <div class="bm-rating"><span class="muted">Оценка:</span> ${stars}</div>
+  </div>`;
+}
+
+function renderBenchDetail(run, results) {
+  $('bmDetailPanel').style.display = '';
+  $('bmDetailTitle').textContent = `Запуск #${run.id}: ${run.title}`;
+  const params = (() => {
+    try { return JSON.parse(run.params_json || '{}'); } catch { return {}; }
+  })();
+  $('bmDetail').innerHTML = `<div class="bm-meta">
+      <span class="tag tag-a">${esc(BM_MODES[run.mode] || run.mode)}</span>
+      <span class="muted">${esc(fmtDate(run.created_at))}</span>
+      <span class="muted">temp ${esc(params.temperature ?? '—')} · top-p ${esc(params.top_p ?? '—')} · max ${esc(params.max_tokens ?? '—')} ток.</span>
+      ${run.error ? `<span class="tag tag-r">${esc(run.error)}</span>` : ''}
+    </div>
+    <details class="bm-prompt"><summary>Показать запрос целиком</summary>
+      <pre class="code">${esc(run.prompt)}</pre>
+      ${run.system_prompt ? `<div class="muted" style="margin-top:8px">Системный промпт</div><pre class="code">${esc(run.system_prompt)}</pre>` : ''}
+      ${run.example_input ? `<div class="muted" style="margin-top:8px">Пример запроса</div><pre class="code">${esc(run.example_input)}</pre>` : ''}
+      ${run.example_answer ? `<div class="muted" style="margin-top:8px">Пример ответа</div><pre class="code">${esc(run.example_answer)}</pre>` : ''}
+    </details>
+    <div class="bm-grid">${results.map((r) => benchResultCard(r, run.id)).join('')}</div>`;
+  $('bmDetailPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function openBench(id) {
+  try {
+    const d = await api('/api/v1/benchmarks/' + id);
+    bm.detailRun = d.run.id;
+    renderBenchDetail(d.run, d.results || []);
+  } catch (e) {
+    toast('Ошибка: ' + e.message, 'err');
+  }
+}
+
+function closeBenchDetail() {
+  bm.detailRun = null;
+  $('bmDetailPanel').style.display = 'none';
+}
+
+async function rateBench(resultId, rating, runId) {
+  try {
+    await api(`/api/v1/benchmarks/results/${resultId}/rating`, { method: 'POST', body: { rating } });
+    const d = await api('/api/v1/benchmarks/' + runId);
+    renderBenchDetail(d.run, d.results || []);
+    loadBench();
+  } catch (e) {
+    toast('Ошибка: ' + e.message, 'err');
+  }
+}
+
+async function deleteBench(id) {
+  if (!confirm('Удалить запуск #' + id + ' вместе со всеми ответами?')) return;
+  try {
+    await api('/api/v1/benchmarks/' + id, { method: 'DELETE' });
+    if (bm.detailRun === id) closeBenchDetail();
+    toast('Запуск удалён', 'ok');
+    loadBench();
+  } catch (e) {
+    toast('Ошибка: ' + e.message, 'err');
+  }
+}
+
 // ─────────────────────────────── Старт ───────────────────────────────
 
 document.addEventListener('DOMContentLoaded', async () => {
   applyAccent(state.accent);
   setTheme(state.theme);
-  loadCatalog();
+  restoreCatalogCache();
 
   $('mStudent').addEventListener('click', (e) => {
     if (e.target === $('mStudent')) closeStudent();
+  });
+  $('mProfile').addEventListener('click', (e) => {
+    if (e.target === $('mProfile')) closeProfile();
   });
 
   ['mUser', 'mPass', 'mSetup'].forEach((id) => {

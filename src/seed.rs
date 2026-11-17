@@ -20,14 +20,17 @@ const SUBJECTS: &[&str] = &[
     "Английский язык",
     "Дискретная математика",
 ];
-const FIRST_NAMES: &[&str] = &[
-    "Александр", "Дмитрий", "Екатерина", "Фёдор", "Алиса", "Иван", "Мария", "Николай", "Ольга",
-    "Сергей", "Анна", "Пётр", "Ксения", "Артём", "Вера", "Павел", "Юлия", "Роман",
+const FIRST_NAMES_M: &[&str] = &[
+    "Александр", "Дмитрий", "Фёдор", "Иван", "Николай", "Сергей", "Пётр", "Артём", "Павел", "Роман",
 ];
-const LAST_NAMES: &[&str] = &[
-    "Иванов", "Петров", "Сидоров", "Кузнецова", "Смирнова", "Волков", "Морозова", "Зайцев",
-    "Павлова", "Семёнов", "Голубева", "Виноградов", "Богданова", "Воробьёв", "Фёдорова",
-    "Михайлов", "Беляева", "Тарасов",
+const FIRST_NAMES_F: &[&str] = &[
+    "Екатерина", "Алиса", "Мария", "Ольга", "Анна", "Ксения", "Вера", "Юлия",
+];
+/// Мужские формы фамилий; женская образуется добавлением «а».
+const LAST_NAMES_M: &[&str] = &[
+    "Иванов", "Петров", "Сидоров", "Кузнецов", "Смирнов", "Волков", "Морозов", "Зайцев",
+    "Павлов", "Семёнов", "Голубев", "Виноградов", "Богданов", "Воробьёв", "Фёдоров",
+    "Михайлов", "Беляев", "Тарасов",
 ];
 const TOPICS: &[&str] = &[
     "Домашняя работа №{}",
@@ -35,6 +38,15 @@ const TOPICS: &[&str] = &[
     "Практическое занятие №{}",
     "Контрольная работа №{}",
     "Проектное задание №{}",
+];
+const PARENT_FIRST_M: &[&str] = &["Алексей", "Сергей", "Андрей", "Владимир", "Дмитрий"];
+const PARENT_FIRST_F: &[&str] = &["Ирина", "Ольга", "Наталья", "Елена", "Татьяна", "Валерия", "Мария"];
+const STREETS: &[&str] = &[
+    "ул. Школьная", "ул. Солнечная", "ул. Лесная", "пр-т Центральный", "ул. Молодёжная",
+    "ул. Садовая", "ул. Речная", "ул. Северная", "ул. Южная", "ул. Новая",
+];
+const JOBS: &[&str] = &[
+    "инженер", "слесарь", "врач", "учитель", "бухгалтер", "водитель", "временно не работает",
 ];
 
 /// Заполнить БД демонстрационными учениками и активностью.
@@ -49,8 +61,14 @@ pub fn seed(db: &Db) -> Result<usize> {
     let mut total_activities = 0usize;
 
     for i in 0..24 {
-        let first = FIRST_NAMES[rng.gen_range(0..FIRST_NAMES.len())];
-        let last = LAST_NAMES[rng.gen_range(0..LAST_NAMES.len())];
+        let male_student = rng.gen_bool(0.5);
+        let first = if male_student {
+            FIRST_NAMES_M[rng.gen_range(0..FIRST_NAMES_M.len())]
+        } else {
+            FIRST_NAMES_F[rng.gen_range(0..FIRST_NAMES_F.len())]
+        };
+        let last_base = LAST_NAMES_M[rng.gen_range(0..LAST_NAMES_M.len())];
+        let last = if male_student { last_base.to_string() } else { format!("{last_base}а") };
         let full_name = format!("{first} {last}");
         let external_id = format!("STU-{:04}", 1001 + i);
         let group = GROUPS[rng.gen_range(0..GROUPS.len())];
@@ -58,13 +76,65 @@ pub fn seed(db: &Db) -> Result<usize> {
         let email = format!(
             "{}.{}@edu.local",
             translit(first).to_lowercase(),
-            translit(last).to_lowercase()
+            translit(&last).to_lowercase()
+        );
+        // Правдоподобный профиль: дата рождения, адрес и семья.
+        let birth_year = 2026 - (14 + rng.gen_range(0..4));
+        let birth_date = format!(
+            "{:02}.{:02}.{}",
+            rng.gen_range(1..=28),
+            rng.gen_range(1..=12),
+            birth_year
+        );
+        let address = format!(
+            "г. Примерск, {}, д. {}, кв. {}",
+            STREETS[rng.gen_range(0..STREETS.len())],
+            rng.gen_range(1..=90),
+            rng.gen_range(1..=120)
+        );
+        let father_first = PARENT_FIRST_M[rng.gen_range(0..PARENT_FIRST_M.len())];
+        let mother_first = PARENT_FIRST_F[rng.gen_range(0..PARENT_FIRST_F.len())];
+        // В демо-семье родители носят ту же фамилию, что и ученик: так данные
+        // выглядят связно и не похожи на случайный набор чужих людей.
+        let father_last = last_base.to_string();
+        let mother_last = format!("{last_base}а");
+        let father_birth_year = birth_year - rng.gen_range(24..=38);
+        let mother_birth_year = birth_year - rng.gen_range(22..=36);
+        let sibling = if rng.gen_bool(0.55) {
+            let sister = rng.gen_bool(0.5);
+            let sibling_first = if sister {
+                FIRST_NAMES_F[rng.gen_range(0..FIRST_NAMES_F.len())]
+            } else {
+                FIRST_NAMES_M[rng.gen_range(0..FIRST_NAMES_M.len())]
+            };
+            let sibling_last = if sister { format!("{last_base}а") } else { last_base.to_string() };
+            format!(
+                "Младший брат/сестра: {} {}, {} г. р., учащийся школы.",
+                sibling_first,
+                sibling_last,
+                birth_year + rng.gen_range(2..=7)
+            )
+        } else {
+            "Единственный ребёнок в семье.".to_string()
+        };
+        let family = format!(
+            "Полная семья. Отец: {} {}, {} г. р. (занятость: {}); мать: {} {}, {} г. р. (занятость: {}). {}\n\
+             Родители интересуются учёбой, поддерживают связь с классным руководителем.",
+            father_first,
+            father_last,
+            father_birth_year,
+            JOBS[rng.gen_range(0..JOBS.len())],
+            mother_first,
+            mother_last,
+            mother_birth_year,
+            JOBS[rng.gen_range(0..JOBS.len())],
+            sibling
         );
 
         conn.execute(
-            "INSERT INTO students(external_id, full_name, group_name, email, grade)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![external_id, full_name, group, email, grade],
+            "INSERT INTO students(external_id, full_name, group_name, email, grade, birth_date, address, family)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![external_id, full_name, group, email, grade, birth_date, address, family],
         )?;
         let student_id = conn.last_insert_rowid();
 

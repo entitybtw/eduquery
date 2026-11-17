@@ -135,7 +135,7 @@ pub async fn change_my_password(
 
 // ─────────────────────────────── экспорт CSV ───────────────────────────────
 
-fn csv_response(filename: &str, rows: Vec<Vec<String>>) -> Response {
+pub(crate) fn csv_response(filename: &str, rows: Vec<Vec<String>>) -> Response {
     let mut wtr = csv::Writer::from_writer(Vec::new());
     for r in &rows {
         let _ = wtr.write_record(r);
@@ -204,7 +204,8 @@ pub async fn export_students(
         Err(e) => return err(format!("ошибка БД: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     };
     let mut rows = vec![header(&[
-        "ID ученика", "ФИО", "Группа", "Эл. почта", "Курс", "Записей", "Средний балл",
+        "ID ученика", "ФИО", "Группа", "Эл. почта", "Дата рождения", "Адрес", "Семья",
+        "Курс", "Записей", "Средний балл",
         "Успеваемость, %", "Средняя оценка", "Пропущено уроков", "Из них без уважит. причины",
         "Записей в портфолио", "Поощрений", "Замечаний и нарушений", "Питался, % дней",
         "Время, мин", "Последняя активность",
@@ -215,6 +216,9 @@ pub async fn export_students(
             s.full_name,
             s.group_name,
             s.email,
+            s.birth_date,
+            s.address,
+            s.family,
             opt(s.grade),
             s.activities.to_string(),
             num(s.avg_score),

@@ -29,7 +29,14 @@ pub struct GenParams {
     pub n_ctx: u32,
     pub n_threads: i32,
     pub seed: u64,
+    /// Системная инструкция: роль, правила и формат ответа.
     pub system_prompt: String,
+    /// Пример запроса для режима «покажи на примере» (few-shot).
+    #[serde(default)]
+    pub example_input: String,
+    /// Пример ответа, которому должна следовать модель (few-shot).
+    #[serde(default)]
+    pub example_answer: String,
 }
 
 impl Default for GenParams {
@@ -43,10 +50,12 @@ impl Default for GenParams {
             // структурированных ответах.
             dry_multiplier: 0.8,
             max_tokens: 1024,
-            n_ctx: 4096,
+            n_ctx: 8192,
             n_threads: 0,
             seed: 0,
             system_prompt: String::new(),
+            example_input: String::new(),
+            example_answer: String::new(),
         }
     }
 }
@@ -67,6 +76,8 @@ pub struct GenOutput {
     pub tokens_per_sec: f64,
     /// Модель ушла в повтор — генерация была прервана досрочно.
     pub loop_detected: bool,
+    /// Время генерации без учёта загрузки модели, миллисекунды.
+    pub duration_ms: u64,
 }
 
 /// Запущенный llama-server.
@@ -607,6 +618,7 @@ impl Engine {
             completion_tokens,
             tokens_per_sec: completion_tokens as f64 / elapsed,
             loop_detected,
+            duration_ms: (elapsed * 1000.0).round() as u64,
         })
     }
 }

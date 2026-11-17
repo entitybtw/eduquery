@@ -5,6 +5,7 @@
 
 mod analysis;
 mod auth;
+mod bench;
 mod config;
 mod db;
 mod llm;
@@ -56,6 +57,12 @@ async fn main() -> Result<()> {
 
     // ── модели ──
     let store = Arc::new(ModelStore::new(cfg.models_dir()));
+    // Сверяем файлы на диске с таблицей models: после обновления/ручного
+    // копирования модели должны быть видны без перезапуска вручную.
+    if let Err(e) = store.reconcile(&db) {
+        tracing::warn!("не удалось сверить модели с БД: {e:#}");
+    }
+    restore_active_model(&db, &engine, &store);
 
     // ── авторизация ──
     users::ensure_admin(&db, &cfg.admin_user, &cfg.admin_pass)?;
@@ -76,6 +83,7 @@ async fn main() -> Result<()> {
         auth,
         web_dir,
         allow_remote_download: cfg.allow_remote_download,
+        bench: bench::BenchState::new(),
     });
 
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse()?;
@@ -87,4 +95,27 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("eduquery=info,tower_http=warn,warn"));
     fmt().with_env_filter(filter).with_target(false).init();
+}
+
+/// Вернуть активную модель после перезапуска: сохранённый id, иначе первый
+/// найденный GGUF. Без этого панель после рестарта оставалась «без модели».
+fn restore_active_model(db: &Db, engine: &Engine, store: &ModelStore) {
+    let saved = db.get_setting("active_model_id").unwrap_or_default();
+    if !saved.trim().is_empty() {
+        let path = store.path_for(saved.trim());
+        if path.exists() {
+            engine.set_active(&path);
+            tracing::info!("активная модель восстановлена: {saved}");
+            return;
+        }
+        let _ = db.set_setting("active_model_id", "");
+    }
+    if engine.active_model().is_none() {
+        if let Some((id, _)) = store.list_files().first() {
+            let path = store.path_for(id);
+            engine.set_active(&path);
+            let _ = db.set_setting("active_model_id", id);
+            tracing::info!("активная модель назначена автоматически: {id}");
+        }
+    }
 }
